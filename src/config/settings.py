@@ -120,6 +120,8 @@ INSTALLED_APPS = [
     "integrations",
     "lists",
     "users",
+    # Fork: per-user Hardcover tokens
+    "hardcover_sync",
     "debug_toolbar",
     "django_celery_beat",
     "django_celery_results",
@@ -145,6 +147,8 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "django.contrib.auth.middleware.LoginRequiredMiddleware",
+    # Fork: use the signed-in user's own Hardcover token
+    "hardcover_sync.middleware.HardcoverTokenMiddleware",
     "simple_history.middleware.HistoryRequestMiddleware",
     "allauth.account.middleware.AccountMiddleware",
     "app.middleware.ProviderAPIErrorMiddleware",

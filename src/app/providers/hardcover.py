@@ -5,10 +5,12 @@ import re
 import requests
 from django.conf import settings
 from django.core.cache import cache
+from django.utils.translation import gettext as _
 
 from app import helpers
 from app.models import MediaTypes, Sources
 from app.providers import services
+from hardcover_sync import tokens
 
 logger = logging.getLogger(__name__)
 
@@ -65,17 +67,32 @@ def handle_error(error):
     raise services.ProviderAPIError(Sources.HARDCOVER.value, error)
 
 
-def graphql_request(query, variables):
-    """Make a GraphQL request to Hardcover and return the response."""
+def graphql_request(query, variables, token=None):
+    """Make a GraphQL request to Hardcover and return the response.
+
+    Without an explicit token, the signed-in user's own token is used when they
+    saved one, otherwise the shared HARDCOVER_API token (see hardcover_sync.tokens).
+    """
+    user_token = None if token else tokens.current_user_token()
+    authorization = token or user_token or settings.HARDCOVER_API
     try:
         response = services.api_request(
             Sources.HARDCOVER.value,
             "POST",
             base_url,
             params={"query": query, "variables": variables},
-            headers={"Authorization": settings.HARDCOVER_API},
+            headers={"Authorization": authorization},
         )
     except requests.exceptions.HTTPError as error:
+        if user_token and error.response.status_code == requests.codes.unauthorized:
+            raise services.ProviderAPIError(
+                Sources.HARDCOVER.value,
+                error,
+                _(
+                    "Hardcover rejected your personal API token. Update it under "
+                    "Settings > Integrations, or remove it to use the shared token.",
+                ),
+            ) from error
         handle_error(error)
 
     # GraphQL errors are returned with a 200 status code
@@ -97,6 +114,19 @@ def graphql_request(query, variables):
         )
 
     return response
+
+
+def get_username(token):
+    """Return the Hardcover username a token belongs to.
+
+    Raises ProviderAPIError when Hardcover rejects the token.
+    """
+    response = graphql_request("query CurrentUser { me { username } }", {}, token)
+    me = response["data"]["me"]
+    # Hardcover returns the current user as a one-element list
+    if isinstance(me, list):
+        me = me[0] if me else {}
+    return (me or {}).get("username")
 
 
 def parse_search_filters(query):
