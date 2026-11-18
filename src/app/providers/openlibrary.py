@@ -197,6 +197,10 @@ async def async_book(media_id):
             "related": {
                 "other_editions": await editions_task,
             },
+            # Open Library search supports author:"..." natively
+            "detail_links": {
+                "author": {name: f'author:"{name}"' for name in authors or []},
+            },
         }
 
         # don't cache missing authors from transient errors for the full timeout

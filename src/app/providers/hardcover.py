@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 
 import requests
 from django.conf import settings
@@ -13,6 +14,19 @@ logger = logging.getLogger(__name__)
 
 base_url = "https://api.hardcover.app/v1/graphql"
 MAX_SEARCH_QUERY_LENGTH = 50
+
+# Search syntax keyword -> Hardcover search document field
+SEARCH_FILTER_FIELDS = {
+    "author": "author_names",
+    "series": "series_names",
+}
+SEARCH_FILTER_PATTERN = re.compile(
+    r'(?<!\S)(author|series):(?:"([^"]*)"|(\S+))',
+    re.IGNORECASE,
+)
+
+# Contribution roles that count as the book's authors (None is the default role)
+AUTHOR_CONTRIBUTIONS = {None, "", "Author"}
 
 
 def cap_search_query(query):
@@ -85,22 +99,64 @@ def graphql_request(query, variables):
     return response
 
 
+def parse_search_filters(query):
+    """Split a search query into free text and field filters.
+
+    Supports ``author:"Blake Crouch"`` and ``series:"Wayward Pines"`` (quotes are
+    optional for single words). Returns a tuple of (text, filters), where filters
+    is a list of (search field, value) tuples in the order they appeared.
+    """
+    filters = []
+
+    def collect(match):
+        value = match.group(2) if match.group(2) is not None else match.group(3)
+        # Backticks delimit values in Typesense filters, so they can't be escaped
+        value = value.strip().strip('"').replace("`", "").strip()
+        if value:
+            filters.append((SEARCH_FILTER_FIELDS[match.group(1).lower()], value))
+        return " "
+
+    text = SEARCH_FILTER_PATTERN.sub(collect, str(query or ""))
+    return " ".join(text.split()), filters
+
+
+def build_filter_by(filters):
+    """Build a Typesense filter_by expression from parsed search filters."""
+    return " && ".join(f"{field}:=[`{value}`]" for field, value in filters)
+
+
 def search(query, page):
-    """Search for books on Hardcover."""
-    query = cap_search_query(query)
+    """Search for books on Hardcover.
+
+    Besides plain text, the query can filter by author or series, for example
+    ``author:"Blake Crouch"`` or ``dark series:"Wayward Pines"``.
+    """
+    text, filters = parse_search_filters(query)
+    query = cap_search_query(text)
+    filter_by = build_filter_by(filters) or None
+
+    cache_query = f"{query}_{filter_by}" if filter_by else query
     cache_key = (
-        f"search_{Sources.HARDCOVER.value}_{MediaTypes.BOOK.value}_{query}_{page}"
+        f"search_{Sources.HARDCOVER.value}_{MediaTypes.BOOK.value}_{cache_query}_{page}"
     )
     data = cache.get(cache_key)
 
     if data is None:
         search_query = """
-        query SearchBooks($query: String!, $per_page: Int!, $page: Int!) {
+        query SearchBooks(
+          $query: String!,
+          $per_page: Int!,
+          $page: Int!,
+          $filter_by: String,
+          $sort: String,
+        ) {
           search(
             query: $query,
             query_type: "Book",
             per_page: $per_page,
             page: $page,
+            filter_by: $filter_by,
+            sort: $sort,
           ) {
             results
           }
@@ -108,14 +164,20 @@ def search(query, page):
         """
 
         variables = {
-            "query": query,
+            # Typesense uses "*" to match everything, so filters work without text
+            "query": query or "*",
             "per_page": settings.PER_PAGE,
             "page": page,
+            "filter_by": filter_by,
+            # Without text there is no relevance, so show the most read books first
+            "sort": "users_count:desc" if filter_by else None,
         }
 
         response = graphql_request(search_query, variables)
 
-        hits = response["data"]["search"]["results"]["hits"]
+        # Hardcover returns null results when a filter can't be applied
+        search_results = response["data"]["search"]["results"] or {}
+        hits = search_results.get("hits", [])
         results = [
             {
                 "media_id": hit["document"]["id"],
@@ -126,7 +188,7 @@ def search(query, page):
             }
             for hit in hits
         ]
-        total_results = response["data"]["search"]["results"]["found"]
+        total_results = search_results.get("found", 0)
 
         data = helpers.format_search_response(
             page,
@@ -159,7 +221,18 @@ def book(media_id):
             pages
             release_date
             slug
-            cached_contributors(path: "[0]['author']['name']")
+            contributions {
+              contribution
+              author {
+                name
+              }
+            }
+            book_series(order_by: [{featured: desc}, {position: asc}]) {
+              position
+              series {
+                name
+              }
+            }
             default_cover_edition {
               edition_format
               isbn_13
@@ -189,6 +262,8 @@ def book(media_id):
             )
 
         edition_details = get_edition_details(book_data.get("default_cover_edition"))
+        authors = get_authors(book_data.get("contributions"))
+        series = get_series(book_data.get("book_series"))
 
         data = {
             "media_id": book_data["id"],
@@ -207,15 +282,77 @@ def book(media_id):
                 "number_of_pages": book_data.get("pages"),
                 "publish_date": edition_details.get("release_date")
                 or book_data.get("release_date"),
-                "author": book_data.get("cached_contributors"),
+                "author": authors or None,
+                "series": [label for label, _name in series] or None,
                 "publisher": edition_details.get("publisher"),
                 "isbn": edition_details.get("isbn"),
+            },
+            # Detail values that link to a search, keyed by detail then value
+            "detail_links": {
+                "author": {name: search_filter("author", name) for name in authors},
+                "series": {
+                    label: search_filter("series", name) for label, name in series
+                },
             },
         }
 
         cache.set(cache_key, data)
 
     return data
+
+
+def search_filter(field, value):
+    """Return the search query that filters books by a field value."""
+    return f'{field}:"{value}"'
+
+
+def get_authors(contributions):
+    """Get the unique author names from the book's contributions.
+
+    Other roles like illustrators or translators are skipped, unless there are
+    no authors at all.
+    """
+    if not contributions:
+        return []
+
+    names = [
+        contribution["author"]["name"]
+        for contribution in contributions
+        if contribution.get("contribution") in AUTHOR_CONTRIBUTIONS
+        and contribution.get("author")
+    ]
+    if not names:
+        names = [
+            contribution["author"]["name"]
+            for contribution in contributions[:1]
+            if contribution.get("author")
+        ]
+
+    return list(dict.fromkeys(name for name in names if name))
+
+
+def get_series(book_series):
+    """Get the series a book belongs to as (label, series name) tuples.
+
+    The label adds the book's position, e.g. "Wayward Pines (#1)".
+    """
+    if not book_series:
+        return []
+
+    series = []
+    seen = set()
+    for entry in book_series:
+        name = (entry.get("series") or {}).get("name")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        position = entry.get("position")
+        # 1.0 -> "1", 1.5 -> "1.5"
+        label = name if position is None else f"{name} (#{float(position):g})"
+        series.append((label, name))
+
+    return series
 
 
 def get_tags(tags_data):

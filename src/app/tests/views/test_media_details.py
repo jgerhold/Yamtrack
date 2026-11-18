@@ -311,3 +311,51 @@ class MediaDetailsViewTests(TestCase):
         )
 
         self.assertNotContains(response, "h-1.25")
+
+    @patch("app.providers.services.get_media_metadata")
+    def test_book_details_link_author_and_series(self, mock_get_metadata):
+        """Test book authors and series link to a filtered search."""
+        mock_get_metadata.return_value = {
+            "media_id": "250488",
+            "title": "Pines",
+            "media_type": MediaTypes.BOOK.value,
+            "source": Sources.HARDCOVER.value,
+            "source_url": "https://hardcover.app/books/pines",
+            "image": "http://example.com/image.jpg",
+            "max_progress": 309,
+            "details": {
+                "author": ["Blake Crouch"],
+                "series": ["Wayward Pines (#1)"],
+                "number_of_pages": 309,
+            },
+            "detail_links": {
+                "author": {"Blake Crouch": 'author:"Blake Crouch"'},
+                "series": {"Wayward Pines (#1)": 'series:"Wayward Pines"'},
+            },
+        }
+
+        response = self.client.get(
+            reverse(
+                "media_details",
+                kwargs={
+                    "source": Sources.HARDCOVER.value,
+                    "media_type": MediaTypes.BOOK.value,
+                    "media_id": "250488",
+                    "title": "pines",
+                },
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        search_url = reverse("search")
+        self.assertContains(
+            response,
+            f'href="{search_url}?q=author%3A%22Blake+Crouch%22'
+            '&amp;media_type=book&amp;source=hardcover"',
+        )
+        self.assertContains(
+            response,
+            f'href="{search_url}?q=series%3A%22Wayward+Pines%22'
+            '&amp;media_type=book&amp;source=hardcover"',
+        )
+        self.assertContains(response, "Wayward Pines (#1)")

@@ -696,7 +696,12 @@ class Metadata(TestCase):
         """Test the metadata method for books from Hardcover."""
         response = hardcover.book("377193")
         self.assertEqual(response["title"], "The Great Gatsby")
-        self.assertEqual(response["details"]["author"], "F. Scott Fitzgerald")
+        # The introduction's writer is a contributor, not an author
+        self.assertEqual(response["details"]["author"], ["F. Scott Fitzgerald"])
+        self.assertEqual(
+            response["detail_links"]["author"],
+            {"F. Scott Fitzgerald": 'author:"F. Scott Fitzgerald"'},
+        )
         self.assertIn("Classics", response["genres"])
         self.assertAlmostEqual(response["score"], 7.4, delta=0.1)
 
@@ -704,7 +709,7 @@ class Metadata(TestCase):
         """Test the metadata method for books from Hardcover with minimal data."""
         response = hardcover.book("1265528")
         self.assertEqual(response["title"], "MiNRS")
-        self.assertEqual(response["details"]["author"], "Kevin Sylvester")
+        self.assertEqual(response["details"]["author"], ["Kevin Sylvester"])
         self.assertEqual(response["details"]["publish_date"], "2015-09-22")
         # These fields should be None or default values
         self.assertEqual(response["synopsis"], "No synopsis available.")
@@ -965,6 +970,53 @@ class Metadata(TestCase):
         self.assertEqual(hardcover.get_ratings(4.5), 9.0)
 
         self.assertIsNone(hardcover.get_ratings(None))
+
+    def test_hardcover_book_series(self):
+        """Test the metadata of a Hardcover book in a series."""
+        response = hardcover.book("250488")  # Pines by Blake Crouch
+        self.assertIn("Wayward Pines (#1)", response["details"]["series"])
+        self.assertEqual(
+            response["detail_links"]["series"]["Wayward Pines (#1)"],
+            'series:"Wayward Pines"',
+        )
+
+    def test_hardcover_get_authors(self):
+        """Test only author contributions are kept, without duplicates."""
+        contributions = [
+            {"contribution": "Author", "author": {"name": "J.K. Rowling"}},
+            {"contribution": "Illustrator", "author": {"name": "Mary GrandPré"}},
+            {"contribution": None, "author": {"name": "Co Author"}},
+            {"contribution": "Author", "author": {"name": "J.K. Rowling"}},
+        ]
+        self.assertEqual(
+            hardcover.get_authors(contributions),
+            ["J.K. Rowling", "Co Author"],
+        )
+
+        # Fall back to the first contributor when nobody is credited as author
+        only_editor = [{"contribution": "Editor", "author": {"name": "Ed"}}]
+        self.assertEqual(hardcover.get_authors(only_editor), ["Ed"])
+
+        self.assertEqual(hardcover.get_authors(None), [])
+
+    def test_hardcover_get_series(self):
+        """Test series labels include the book's position."""
+        book_series = [
+            {"position": 1.0, "series": {"name": "Harry Potter"}},
+            {"position": 1.5, "series": {"name": "Wizarding World"}},
+            {"position": None, "series": {"name": "Untitled"}},
+            {"position": 2.0, "series": {"name": "Harry Potter"}},
+            {"position": 3.0, "series": None},
+        ]
+        self.assertEqual(
+            hardcover.get_series(book_series),
+            [
+                ("Harry Potter (#1)", "Harry Potter"),
+                ("Wizarding World (#1.5)", "Wizarding World"),
+                ("Untitled", "Untitled"),
+            ],
+        )
+        self.assertEqual(hardcover.get_series(None), [])
 
     def test_hardcover_get_edition_details(self):
         """Test the get_edition_details function from Hardcover provider."""

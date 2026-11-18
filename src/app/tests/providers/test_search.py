@@ -288,6 +288,88 @@ class Search(TestCase):
         for book in response["results"]:
             self.assertTrue(all(key in book for key in required_keys))
 
+    def test_hardcover_author_filter(self):
+        """Test searching Hardcover books by author returns only their books."""
+        response = hardcover.search('author:"Blake Crouch"', 1)
+        titles = [book["title"] for book in response["results"]]
+
+        self.assertGreater(response["total_results"], 0)
+        self.assertIn("Dark Matter", titles)
+
+    def test_hardcover_series_filter_with_text(self):
+        """Test free text and a series filter can be combined."""
+        response = hardcover.search('wayward series:"Wayward Pines"', 1)
+        titles = [book["title"] for book in response["results"]]
+
+        self.assertIn("Wayward", titles)
+        self.assertNotIn("Dark Matter", titles)
+
+    @patch("app.providers.hardcover.services.api_request")
+    def test_hardcover_filter_variables(self, mock_api_request):
+        """Test filters are sent as filter_by and sorted by popularity."""
+        mock_api_request.return_value = {
+            "data": {"search": {"results": {"hits": [], "found": 0}}},
+        }
+        cache.clear()
+
+        hardcover.search('author:"Blake Crouch" series:"Wayward Pines"', 1)
+
+        _, kwargs = mock_api_request.call_args
+        variables = kwargs["params"]["variables"]
+        self.assertEqual(variables["query"], "*")
+        self.assertEqual(
+            variables["filter_by"],
+            "author_names:=[`Blake Crouch`] && series_names:=[`Wayward Pines`]",
+        )
+        self.assertEqual(variables["sort"], "users_count:desc")
+
+    @patch("app.providers.hardcover.services.api_request")
+    def test_hardcover_plain_search_has_no_filter(self, mock_api_request):
+        """Test a plain text search sends no filter or sort."""
+        mock_api_request.return_value = {
+            "data": {"search": {"results": {"hits": [], "found": 0}}},
+        }
+        cache.clear()
+
+        hardcover.search("dark matter", 1)
+
+        _, kwargs = mock_api_request.call_args
+        variables = kwargs["params"]["variables"]
+        self.assertEqual(variables["query"], "dark matter")
+        self.assertIsNone(variables["filter_by"])
+        self.assertIsNone(variables["sort"])
+
+    @patch("app.providers.hardcover.services.api_request")
+    def test_hardcover_null_results(self, mock_api_request):
+        """Test a filter Hardcover can't apply returns no results, not an error."""
+        mock_api_request.return_value = {"data": {"search": {"results": None}}}
+        cache.clear()
+
+        response = hardcover.search('series:"Unknown"', 1)
+
+        self.assertEqual(response["results"], [])
+        self.assertEqual(response["total_results"], 0)
+
+    def test_hardcover_parse_search_filters(self):
+        """Test filters are split from the free text of a query."""
+        cases = {
+            'author:"Blake Crouch"': ("", [("author_names", "Blake Crouch")]),
+            "pines author:crouch": ("pines", [("author_names", "crouch")]),
+            'Series:"Wayward Pines" dark': (
+                "dark",
+                [("series_names", "Wayward Pines")],
+            ),
+            "dark matter": ("dark matter", []),
+            # Not a filter: no keyword at a word boundary, or an empty value
+            "coauthor:x": ("coauthor:x", []),
+            'author:""': ("", []),
+            "author:`Bad`Name": ("", [("author_names", "BadName")]),
+        }
+
+        for query, expected in cases.items():
+            with self.subTest(query=query):
+                self.assertEqual(hardcover.parse_search_filters(query), expected)
+
     def test_hardcover_title_query_cap_stops_at_word_boundary(self):
         """Test the long title cap does not split words."""
         query = "one two three four five six seven eight nine ten eleven twelve"

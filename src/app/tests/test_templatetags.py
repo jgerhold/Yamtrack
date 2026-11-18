@@ -592,3 +592,34 @@ class AppTagsTests(TestCase):
             result,
             '<code class="text-indigo-400">&lt;URLS&gt;</code>',
         )
+
+    def test_detail_search_url(self):
+        """Test detail values declared as links build a search URL."""
+        media = {
+            "media_type": MediaTypes.BOOK.value,
+            "source": Sources.HARDCOVER.value,
+            "detail_links": {"author": {"Blake Crouch": 'author:"Blake Crouch"'}},
+        }
+
+        url = app_tags.detail_search_url(media, "author", "Blake Crouch")
+
+        self.assertEqual(
+            url,
+            f"{reverse('search')}?q=author%3A%22Blake+Crouch%22"
+            "&media_type=book&source=hardcover",
+        )
+
+    def test_detail_search_url_without_link(self):
+        """Test values without a declared link return an empty string."""
+        media = {
+            "media_type": MediaTypes.BOOK.value,
+            "source": Sources.HARDCOVER.value,
+            "detail_links": {"author": {"Blake Crouch": 'author:"Blake Crouch"'}},
+        }
+
+        self.assertEqual(app_tags.detail_search_url(media, "author", "Other"), "")
+        self.assertEqual(app_tags.detail_search_url(media, "isbn", ["123"]), "")
+        self.assertEqual(
+            app_tags.detail_search_url({"media_type": "movie"}, "author", "x"),
+            "",
+        )

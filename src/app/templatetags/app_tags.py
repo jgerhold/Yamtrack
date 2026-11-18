@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlencode
 
 from django import template
 from django.conf import settings
@@ -108,6 +109,7 @@ def media_detail_label(name):
         # Translators: the anime's season of the year, e.g. "Spring 2024"
         "season": lambda: pgettext("media detail", "Season"),
         "seasons": lambda: pgettext("media detail", "Seasons"),
+        "series": lambda: pgettext("media detail", "Series"),
         # Translators: the original material an anime is adapted from
         "source": lambda: pgettext("media detail", "Source"),
         "start_date": lambda: pgettext("media detail", "Start date"),
@@ -162,6 +164,30 @@ def inline_link(url, html_class, label, *, new_tab=False):
             label,
         )
     return format_html('<a href="{}" class="{}">{}</a>', url, html_class, label)
+
+
+@register.simple_tag
+def detail_search_url(media, key, value):
+    """Return the search URL a media detail value links to, or an empty string.
+
+    Providers declare linkable values in ``media["detail_links"]``, mapping a
+    detail key and value to a search query, e.g. ``author:"Blake Crouch"``.
+    """
+    try:
+        query = media.get("detail_links", {}).get(key, {}).get(value)
+    except (AttributeError, TypeError):
+        return ""
+    if not query:
+        return ""
+
+    params = urlencode(
+        {
+            "q": query,
+            "media_type": media["media_type"],
+            "source": media["source"],
+        },
+    )
+    return f"{reverse('search')}?{params}"
 
 
 @register.simple_tag
