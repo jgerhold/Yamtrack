@@ -137,6 +137,24 @@ class CalendarOtherTests(CalendarFixturesMixin, TestCase):
         self.assertEqual(events_bulk[0].datetime, date_parser("2025-10-15"))
 
     @patch("events.calendar.other.services.get_media_metadata")
+    def test_process_other_book_without_page_count(self, mock_get_media_metadata):
+        """A book without a page count still gets its release date event."""
+        mock_get_media_metadata.return_value = {
+            "max_progress": None,
+            "details": {
+                "publish_date": "2026-12-01",
+            },
+        }
+
+        events_bulk = []
+        process_other(self.book_item, events_bulk)
+
+        self.assertEqual(len(events_bulk), 1)
+        self.assertEqual(events_bulk[0].item, self.book_item)
+        self.assertIsNone(events_bulk[0].content_number)
+        self.assertEqual(events_bulk[0].datetime, date_parser("2026-12-01"))
+
+    @patch("events.calendar.other.services.get_media_metadata")
     def test_process_other_invalid_date(self, mock_get_media_metadata):
         """Test process_other with invalid date."""
         mock_get_media_metadata.return_value = {

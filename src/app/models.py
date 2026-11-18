@@ -226,8 +226,20 @@ class MediaManager(models.Manager):
         """Return list of historical model names."""
         return [f"historical{media_type}" for media_type in MediaTypes.values]
 
-    def get_media_list(self, user, media_type, status_filter, sort_filter, search=None):
-        """Get media list based on filters, sorting and search."""
+    def get_media_list(
+        self,
+        user,
+        media_type,
+        status_filter,
+        sort_filter,
+        search=None,
+        release_filter=None,
+    ):
+        """Get media list based on filters, sorting and search.
+
+        release_filter keeps only released or upcoming items, judged by the item's
+        first release event (see _annotate_release_datetime).
+        """
         model = apps.get_model(app_label="app", model_name=media_type)
         queryset = model.objects.filter(user=user.id)
 
@@ -255,9 +267,53 @@ class MediaManager(models.Manager):
         queryset = queryset.select_related("item")
         queryset = self._apply_prefetch_related(queryset, media_type)
 
+        release_filters = users.models.MediaReleaseFilterChoices
+        release_sorts = users.models.MediaReleaseSortChoices
+        if release_filter in (release_filters.RELEASED, release_filters.UPCOMING) or (
+            sort_filter in release_sorts.values
+        ):
+            queryset = self._annotate_release_datetime(queryset)
+
+        if release_filter == release_filters.RELEASED:
+            queryset = queryset.filter(release_datetime__lte=timezone.now())
+        elif release_filter == release_filters.UPCOMING:
+            queryset = queryset.filter(release_datetime__gt=timezone.now())
+
+        if sort_filter in release_sorts.values:
+            release_order = F("release_datetime")
+            release_order = (
+                release_order.desc(nulls_last=True)
+                if sort_filter == release_sorts.RELEASE_NEWEST
+                else release_order.asc(nulls_last=True)
+            )
+            return queryset.order_by(
+                release_order,
+                models.functions.Lower("item__title"),
+            )
+
         if sort_filter:
             return self._sort_media_list(queryset, sort_filter, media_type)
         return queryset
+
+    def _annotate_release_datetime(self, queryset):
+        """Annotate each entry with its item's first release datetime.
+
+        Uses the calendar events of the item. Events dated on the minimum sentinel
+        mark a missing release date and count as unknown (NULL), while the maximum
+        sentinel marks an announced but undated release and stays in the future.
+        """
+        # Compare with the sentinel value itself: a __year lookup on year 1 builds
+        # its range in the active timezone and overflows ahead of UTC (issue #884).
+        unknown_date = events.models.SentinelDatetime.min_datetime()
+        first_release = (
+            events.models.Event.objects.filter(
+                item=models.OuterRef("item"),
+                datetime__gt=unknown_date,
+            )
+            .order_by("datetime")
+            .values("datetime")[:1]
+        )
+        return queryset.annotate(release_datetime=models.Subquery(first_release))
 
     def _apply_prefetch_related(self, queryset, media_type):
         """Apply appropriate prefetch_related based on media type."""
