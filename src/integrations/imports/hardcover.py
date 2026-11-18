@@ -10,6 +10,7 @@ from django.utils.dateparse import parse_datetime
 import app
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
+from hardcover_sync import tokens
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -38,8 +39,24 @@ USERNAME_QUERY = "query CurrentUser { me { username } }"
 
 
 def importer(token, user, mode):
-    """Import books using an encrypted Hardcover personal API token."""
+    """Import books using an encrypted Hardcover personal API token.
+
+    Fork: with token None, the token the user saved under Settings >
+    Integrations is used, read when the import runs (see hardcover_sync).
+    """
     return HardcoverImporter(token, user, mode).import_data()
+
+
+def get_stored_token(user):
+    """Return the user's saved Hardcover token; never the shared one."""
+    try:
+        return tokens.require_user_token(user)
+    except tokens.HardcoverTokenMissingError as error:
+        msg = (
+            "No Hardcover account connected. Save your Hardcover API token "
+            "under Settings > Integrations."
+        )
+        raise MediaImportError(msg) from error
 
 
 def get_username(token):
@@ -81,7 +98,10 @@ class HardcoverImporter:
 
     def __init__(self, encrypted_token, user, mode):
         """Initialize an importer for a user and import mode."""
-        self.token = helpers.decrypt(encrypted_token)
+        if encrypted_token:
+            self.token = helpers.decrypt(encrypted_token)
+        else:
+            self.token = get_stored_token(user)
         self.user = user
         self.mode = mode
         self.warnings = []

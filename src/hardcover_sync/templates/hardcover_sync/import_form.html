@@ -1,0 +1,19 @@
+{% load i18n %}
+{# Hardcover import with the account saved under Settings > Integrations (fork) #}
+<form class="flex items-center justify-between gap-3"
+      method="post"
+      action="{% url 'import_hardcover' %}">
+  {% csrf_token %}
+  <input type="hidden" name="frequency" x-model="importFrequency">
+  <input type="hidden" name="time" x-model="importTime">
+  <input type="hidden" name="mode" x-model="importMode">
+  <p class="text-sm text-gray-200">
+    {% blocktrans trimmed with username=account.username|default:"?" %}
+      Connected as <span class="font-semibold">{{ username }}</span>
+    {% endblocktrans %}
+  </p>
+  <button type="submit"
+          class="px-3 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
+    {% trans "Import" %}
+  </button>
+</form>

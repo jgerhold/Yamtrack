@@ -20,6 +20,7 @@ from django.views.decorators.http import require_GET, require_POST
 
 import users
 from app import helpers as app_helpers
+from hardcover_sync.models import HardcoverAccount
 from integrations import exports, tasks
 from integrations.imports import anilist, hardcover, helpers, simkl, trakt
 from integrations.imports.helpers import MediaImportError
@@ -458,6 +459,9 @@ def import_steam(request):
 def import_hardcover(request):
     """Validate a Hardcover token and queue or schedule a book import."""
     token = request.POST.get("token", "").strip()
+    # Fork: without a pasted token, import with the account saved in Settings
+    if not token and HardcoverAccount.objects.filter(user=request.user).exists():
+        return import_hardcover_with_saved_account(request)
     if not token:
         messages.error(request, "Hardcover API token is required.")
         return redirect("import_data")
@@ -493,6 +497,34 @@ def import_hardcover(request):
             request.POST["time"],
             "Hardcover",
             task_kwargs={"token": encrypted_token},
+        )
+    return redirect("import_data")
+
+
+def import_hardcover_with_saved_account(request):
+    """Queue or schedule a Hardcover import with the user's saved token.
+
+    The task gets no token: the importer reads the saved one when it runs, so a
+    schedule follows token changes and stops working once the token is removed.
+    """
+    account = HardcoverAccount.objects.get(user=request.user)
+    mode = request.POST["mode"]
+    frequency = request.POST["frequency"]
+    if frequency == "once":
+        tasks.import_hardcover.delay(token=None, user_id=request.user.id, mode=mode)
+        messages.info(
+            request,
+            _("The task to import books from Hardcover has been queued."),
+        )
+    else:
+        helpers.create_import_schedule(
+            account.username or request.user.username,
+            request,
+            mode,
+            frequency,
+            request.POST["time"],
+            "Hardcover",
+            task_kwargs={"token": None},
         )
     return redirect("import_data")
 
