@@ -69,6 +69,16 @@ def build_absolute_app_url(request, path):
     return request.build_absolute_uri(path)
 
 
+def search_filter_query(field, value):
+    """Return the search term that filters by a whole field value.
+
+    For example ``author:"Blake Crouch"``. The search syntax has no escape for
+    double quotes, so they are dropped from the value to keep it in one term.
+    """
+    value = " ".join(str(value).replace('"', " ").split())
+    return f'{field}:"{value}"'
+
+
 def minutes_to_hhmm(total_minutes):
     """Convert total minutes to HH:MM format."""
     hours = int(total_minutes / 60)

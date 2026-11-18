@@ -56,6 +56,24 @@ class MediaStatusChoices(models.TextChoices):
     DROPPED = Status.DROPPED.value, Status.DROPPED.label
 
 
+# The release sort and filter below are kept in the session instead of a user field:
+# the per media type sort fields are limited to MediaSortChoices by check constraints,
+# and widening those would need a migration.
+class MediaReleaseSortChoices(models.TextChoices):
+    """Media list sort options by the item's first release date."""
+
+    RELEASE_NEWEST = "release_newest", _("Newest Release")
+    RELEASE_OLDEST = "release_oldest", _("Oldest Release")
+
+
+class MediaReleaseFilterChoices(models.TextChoices):
+    """Media list filter options by whether the item has been released yet."""
+
+    ALL = "all", _("All Releases")
+    RELEASED = "released", _("Released")
+    UPCOMING = "upcoming", _("Upcoming")
+
+
 class LayoutChoices(models.TextChoices):
     """Choices for media list layout options."""
 

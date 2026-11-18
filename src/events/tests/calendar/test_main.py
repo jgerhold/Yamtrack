@@ -194,6 +194,60 @@ class CalendarMainTests(CalendarFixturesMixin, TestCase):
             Event.objects.filter(item=self.season_item, content_number=2).exists(),
         )
 
+    def test_cleanup_removes_book_event_when_page_count_disappears(self):
+        """A book's page-numbered event goes once only an unnumbered one is made."""
+        old_release = timezone.now() - timezone.timedelta(days=30)
+        new_release = timezone.now() + timezone.timedelta(days=30)
+        Event.objects.create(
+            item=self.book_item,
+            content_number=328,
+            datetime=old_release,
+        )
+        new_event = Event(
+            item=self.book_item, content_number=None, datetime=new_release
+        )
+        save_events([new_event])
+
+        cleanup_invalid_events([new_event])
+
+        events = Event.objects.filter(item=self.book_item)
+        self.assertEqual(events.count(), 1)
+        self.assertIsNone(events.get().content_number)
+
+    def test_cleanup_removes_book_event_when_page_count_appears(self):
+        """A book's unnumbered event goes once a page-numbered one is made."""
+        Event.objects.create(
+            item=self.book_item,
+            content_number=None,
+            datetime=timezone.now(),
+        )
+        new_event = Event(
+            item=self.book_item,
+            content_number=328,
+            datetime=timezone.now(),
+        )
+        save_events([new_event])
+
+        cleanup_invalid_events([new_event])
+
+        events = Event.objects.filter(item=self.book_item)
+        self.assertEqual(events.count(), 1)
+        self.assertEqual(events.get().content_number, 328)
+
+    def test_cleanup_keeps_unnumbered_events_of_other_media(self):
+        """Only books switch event kinds; a movie's unnumbered event stays."""
+        Event.objects.create(
+            item=self.movie_item,
+            content_number=None,
+            datetime=timezone.now(),
+        )
+
+        cleanup_invalid_events(
+            [Event(item=self.movie_item, content_number=None, datetime=timezone.now())],
+        )
+
+        self.assertTrue(Event.objects.filter(item=self.movie_item).exists())
+
     @patch("events.calendar.main.process_other")
     def test_fetch_releases_returns_no_updates_message(self, mock_process_other):
         """The final message should mention when nothing was changed."""

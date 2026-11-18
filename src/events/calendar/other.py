@@ -56,7 +56,9 @@ def process_other(item, events_bulk):
         )
 
     elif (
-        item.media_type == MediaTypes.GAME.value
+        # Games have no progress unit, and books without a known page count still
+        # need their release date for the calendar and the media list release filters
+        item.media_type in (MediaTypes.GAME.value, MediaTypes.BOOK.value)
         and date_key in metadata["details"]
         and metadata["details"][date_key]
     ):

@@ -1,5 +1,6 @@
 import logging
 
+from django.db.models import Q
 from django.utils.translation import gettext as _
 
 from app.models import MediaTypes, Sources
@@ -161,6 +162,42 @@ def cleanup_invalid_events(events_bulk):
             )
             events_to_delete.append(event.id)
 
+    events_to_delete.extend(get_stale_book_event_ids(events_bulk))
+
     if events_to_delete:
         deleted_count = Event.objects.filter(id__in=events_to_delete).delete()[0]
         logger.info("Deleted %s invalid events for updated items", deleted_count)
+
+
+def get_stale_book_event_ids(events_bulk):
+    """Return the ids of book events replaced by an event of the other kind.
+
+    A book's release event is numbered by its page count, or unnumbered when the
+    provider has no page count. When the page count appears or disappears, the
+    old event would otherwise stay next to the new one and keep its old date.
+    """
+    numbered_books = set()
+    unnumbered_books = set()
+    for event in events_bulk:
+        if event.item.media_type != MediaTypes.BOOK.value:
+            continue
+        if event.content_number is None:
+            unnumbered_books.add(event.item.id)
+        else:
+            numbered_books.add(event.item.id)
+
+    if not numbered_books and not unnumbered_books:
+        return []
+
+    stale_events = Event.objects.filter(
+        Q(item_id__in=numbered_books, content_number__isnull=True)
+        | Q(item_id__in=unnumbered_books, content_number__isnull=False),
+    )
+    for event in stale_events.select_related("item"):
+        logger.info(
+            "Replaced book event detected: %s - Number %s (scheduled for %s)",
+            event.item,
+            event.content_number,
+            event.datetime,
+        )
+    return [event.id for event in stale_events]

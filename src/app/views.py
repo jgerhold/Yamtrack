@@ -38,12 +38,67 @@ from events.models import Event
 from users.models import (
     DateFormatChoices,
     HomeSortChoices,
+    MediaReleaseFilterChoices,
+    MediaReleaseSortChoices,
     MediaSortChoices,
     MediaStatusChoices,
     User,
 )
 
 logger = logging.getLogger(__name__)
+
+# TV shows and seasons release per episode, so a single release date doesn't fit them
+RELEASE_OPTION_EXCLUDED_TYPES = (MediaTypes.TV.value, MediaTypes.SEASON.value)
+
+
+def get_list_filter_choices(media_type):
+    """Return the (sort choices, release filter choices) offered on a media list."""
+    if media_type in RELEASE_OPTION_EXCLUDED_TYPES:
+        return MediaSortChoices.choices, []
+    return (
+        MediaSortChoices.choices + MediaReleaseSortChoices.choices,
+        MediaReleaseFilterChoices.choices,
+    )
+
+
+def resolve_release_options(request, media_type, sort_filter, *, is_owner):
+    """Return the (sort, release filter) to use for a media list.
+
+    The release sorts and the release filter aren't user fields (see
+    MediaReleaseSortChoices), so the owner's choice is remembered in the session.
+    Choosing one of the regular sorts ends a remembered release sort. Visitors of
+    another user's list only get what is in the URL.
+    """
+    sort_param = request.GET.get("sort")
+    release_param = request.GET.get("release")
+    if media_type in RELEASE_OPTION_EXCLUDED_TYPES:
+        return sort_filter, MediaReleaseFilterChoices.ALL.value
+
+    sort_key = f"{media_type}_release_sort"
+    release_key = f"{media_type}_release_filter"
+
+    if sort_param in MediaReleaseSortChoices.values:
+        sort_filter = sort_param
+        if is_owner:
+            request.session[sort_key] = sort_param
+    elif is_owner:
+        if sort_param in MediaSortChoices.values:
+            request.session.pop(sort_key, None)
+        elif request.session.get(sort_key) in MediaReleaseSortChoices.values:
+            sort_filter = request.session[sort_key]
+
+    if release_param in MediaReleaseFilterChoices.values:
+        release_filter = release_param
+        if is_owner:
+            request.session[release_key] = release_param
+    elif is_owner and request.session.get(release_key) in (
+        MediaReleaseFilterChoices.values
+    ):
+        release_filter = request.session[release_key]
+    else:
+        release_filter = MediaReleaseFilterChoices.ALL.value
+
+    return sort_filter, release_filter
 
 
 @require_GET
@@ -211,6 +266,13 @@ def media_list(request, username, media_type):
             request.GET.get("status"),
         )
 
+    sort_filter, release_filter = resolve_release_options(
+        request,
+        media_type,
+        sort_filter,
+        is_owner=request.user == target_user,
+    )
+
     search_query = request.GET.get("search", "")
     page = request.GET.get("page", 1)
 
@@ -225,7 +287,10 @@ def media_list(request, username, media_type):
         status_filter=status_filter,
         sort_filter=sort_filter,
         search=search_query,
+        release_filter=release_filter,
     )
+
+    sort_choices, release_choices = get_list_filter_choices(media_type)
 
     # Paginate results
     items_per_page = 32
@@ -245,8 +310,10 @@ def media_list(request, username, media_type):
         "layout_class": ".media-grid" if layout == "grid" else "tbody",
         "current_sort": sort_filter,
         "current_status": status_filter,
-        "sort_choices": MediaSortChoices.choices,
+        "current_release": release_filter,
+        "sort_choices": sort_choices,
         "status_choices": MediaStatusChoices.choices,
+        "release_choices": release_choices,
         "target_user": target_user,
     }
 
