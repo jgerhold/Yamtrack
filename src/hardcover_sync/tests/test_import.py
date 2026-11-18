@@ -1,11 +1,14 @@
+import json
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
+from django_celery_beat.models import PeriodicTask
 
-from app.models import Book
+from app.models import Book, Item, MediaTypes, Sources
 from hardcover_sync.models import HardcoverAccount
+from integrations import tasks
 from integrations.imports import hardcover as hardcover_import
 from integrations.imports.helpers import MediaImportError
 
@@ -133,3 +136,77 @@ class SavedAccountImportTests(TestCase):
         HardcoverAccount.objects.filter(user=self.user).delete()
         response = self.client.get(reverse("import_data"))
         self.assertContains(response, 'placeholder="Hardcover API token"')
+
+    @patch("integrations.imports.hardcover.services.api_request")
+    def test_scheduled_import_runs_with_its_stored_kwargs(self, mock_api_request):
+        """A schedule created through the form runs without errors."""
+        mock_api_request.return_value = library_response(21)
+        self.client.post(
+            reverse("import_hardcover"),
+            {"token": "", "mode": "new", "frequency": "daily", "time": "04:00"},
+        )
+        periodic_task = PeriodicTask.objects.get(task="Import from Hardcover")
+
+        # Beat calls the task with exactly these kwargs, username included
+        tasks.import_hardcover(**json.loads(periodic_task.kwargs))
+
+        self.assertTrue(
+            Book.objects.filter(user=self.user, item__media_id="21").exists(),
+        )
+
+    @patch("integrations.imports.hardcover.services.api_request")
+    def test_graphql_errors_are_reported(self, mock_api_request):
+        """A 200 response with errors is an import error, not 0 books."""
+        mock_api_request.return_value = {"errors": [{"message": "invalid-jwt"}]}
+
+        with self.assertRaises(MediaImportError) as context:
+            hardcover_import.importer(None, self.user, "new")
+
+        self.assertIn("invalid-jwt", str(context.exception))
+
+    @patch("integrations.imports.hardcover.services.api_request")
+    def test_newest_read_query_puts_undated_reads_last(self, mock_api_request):
+        """The latest read must not be an undated one."""
+        mock_api_request.return_value = library_response()
+
+        hardcover_import.importer(None, self.user, "new")
+
+        _, kwargs = mock_api_request.call_args
+        self.assertIn("started_at: desc_nulls_last", kwargs["params"]["query"])
+
+    @override_settings(IMG_NONE="https://example.com/none.png")
+    @patch("integrations.imports.hardcover.services.api_request")
+    def test_missing_cover_keeps_existing_image(self, mock_api_request):
+        """A book without a Hardcover cover doesn't blank a known cover."""
+        Item.objects.create(
+            media_id="31",
+            source=Sources.HARDCOVER.value,
+            media_type=MediaTypes.BOOK.value,
+            title="Book 31",
+            image="https://example.com/cover.jpg",
+        )
+        response = library_response(31, 32)
+        for user_book in response["data"]["me"][0]["user_books"]:
+            user_book["book"]["cached_image"] = None
+        mock_api_request.return_value = response
+
+        hardcover_import.importer(None, self.user, "new")
+
+        self.assertEqual(
+            Item.objects.get(media_id="31").image,
+            "https://example.com/cover.jpg",
+        )
+        self.assertEqual(
+            Item.objects.get(media_id="32").image,
+            "https://example.com/none.png",
+        )
+
+    def test_undecryptable_saved_token_explains(self):
+        """A token saved under another SECRET asks to save it again."""
+        with (
+            override_settings(SECRET_KEY="another-secret"),  # noqa: S106
+            self.assertRaises(MediaImportError) as context,
+        ):
+            hardcover_import.importer(None, self.user, "new")
+
+        self.assertIn("can't be read anymore", str(context.exception))

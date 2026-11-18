@@ -45,21 +45,20 @@ class TokenTests(TestCase):
         with override_settings(SECRET_KEY="another-secret"):  # noqa: S106
             self.assertIsNone(tokens.get_user_token(self.reader))
 
-    @override_settings(HARDCOVER_API=SHARED_HEADER)
-    def test_metadata_token_prefers_the_active_users_token(self):
-        """The active user's token wins; others and anonymous use the shared one."""
-        self.assertEqual(tokens.metadata_token(), SHARED_HEADER)
+    def test_current_user_token_follows_the_active_user(self):
+        """Only an active user with a saved token has a current token."""
+        self.assertIsNone(tokens.current_user_token())
 
         reset = tokens.activate_user(self.reader)
         try:
-            self.assertEqual(tokens.metadata_token(), "Bearer own-token")
+            self.assertEqual(tokens.current_user_token(), "Bearer own-token")
         finally:
             tokens.deactivate(reset)
 
         for user in (self.other, AnonymousUser()):
             reset = tokens.activate_user(user)
             try:
-                self.assertEqual(tokens.metadata_token(), SHARED_HEADER)
+                self.assertIsNone(tokens.current_user_token())
             finally:
                 tokens.deactivate(reset)
 

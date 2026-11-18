@@ -460,8 +460,9 @@ def import_hardcover(request):
     """Validate a Hardcover token and queue or schedule a book import."""
     token = request.POST.get("token", "").strip()
     # Fork: without a pasted token, import with the account saved in Settings
-    if not token and HardcoverAccount.objects.filter(user=request.user).exists():
-        return import_hardcover_with_saved_account(request)
+    account = HardcoverAccount.objects.filter(user=request.user).first()
+    if not token and account:
+        return import_hardcover_with_saved_account(request, account)
     if not token:
         messages.error(request, "Hardcover API token is required.")
         return redirect("import_data")
@@ -501,13 +502,12 @@ def import_hardcover(request):
     return redirect("import_data")
 
 
-def import_hardcover_with_saved_account(request):
+def import_hardcover_with_saved_account(request, account):
     """Queue or schedule a Hardcover import with the user's saved token.
 
     The task gets no token: the importer reads the saved one when it runs, so a
     schedule follows token changes and stops working once the token is removed.
     """
-    account = HardcoverAccount.objects.get(user=request.user)
     mode = request.POST["mode"]
     frequency = request.POST["frequency"]
     if frequency == "once":

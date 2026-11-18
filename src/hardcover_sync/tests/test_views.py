@@ -1,5 +1,6 @@
 from unittest.mock import patch
 
+import requests
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
@@ -81,6 +82,33 @@ class HardcoverTokenViewTests(TestCase):
 
         self.assertFalse(HardcoverAccount.objects.filter(user=self.user).exists())
         self.assertTrue(HardcoverAccount.objects.filter(user=other).exists())
+
+    @patch("hardcover_sync.views.hardcover.get_username", return_value=None)
+    def test_token_without_user_is_not_stored(self, _mock_get_username):
+        """A token Hardcover accepts but that has no user is refused."""
+        response = self.client.post(
+            reverse("hardcover_save_token"),
+            {"token": "no-user"},
+            follow=True,
+        )
+
+        self.assertFalse(HardcoverAccount.objects.exists())
+        self.assertContains(response, "Hardcover rejected this token")
+
+    @patch("hardcover_sync.views.hardcover.get_username")
+    def test_unreachable_hardcover_is_a_form_error(self, mock_get_username):
+        """A network error while checking the token doesn't crash the page."""
+        mock_get_username.side_effect = requests.exceptions.ConnectionError()
+
+        response = self.client.post(
+            reverse("hardcover_save_token"),
+            {"token": "abc"},
+            follow=True,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(HardcoverAccount.objects.exists())
+        self.assertContains(response, "Could not reach Hardcover")
 
     def test_empty_token(self):
         """An empty token is refused."""

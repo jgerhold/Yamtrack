@@ -122,7 +122,7 @@ def get_username(token):
     Raises ProviderAPIError when Hardcover rejects the token.
     """
     response = graphql_request("query CurrentUser { me { username } }", {}, token)
-    me = response["data"]["me"]
+    me = (response.get("data") or {}).get("me")
     # Hardcover returns the current user as a one-element list
     if isinstance(me, list):
         me = me[0] if me else {}

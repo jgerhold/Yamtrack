@@ -2,13 +2,12 @@
 
 A user who saved their own token always uses it, for every Hardcover request
 made on their behalf. The shared HARDCOVER_API token is only a fallback for the
-existing metadata features (search, book details, calendar releases): new
+existing metadata features (search, book details, calendar releases; see
+app.providers.hardcover.graphql_request): new
 per-user features must call require_user_token and fail without a user token.
 """
 
 from contextvars import ContextVar
-
-from django.conf import settings
 
 _current_user = ContextVar("hardcover_current_user", default=None)
 
@@ -50,11 +49,6 @@ def get_user_token(user):
 def current_user_token():
     """Return the own token of the user active in this context, or None."""
     return get_user_token(_current_user.get())
-
-
-def metadata_token():
-    """Return the token for metadata requests: the user's own, else the shared one."""
-    return current_user_token() or settings.HARDCOVER_API
 
 
 def require_user_token(user):

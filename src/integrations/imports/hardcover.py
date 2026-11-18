@@ -4,6 +4,7 @@ import logging
 from collections import defaultdict
 
 import requests
+from django.conf import settings
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -11,6 +12,7 @@ import app
 from app.models import MediaTypes, Sources, Status
 from app.providers import services
 from hardcover_sync import tokens
+from hardcover_sync.models import HardcoverAccount
 from integrations.imports import helpers
 from integrations.imports.helpers import MediaImportError, MediaImportUnexpectedError
 
@@ -28,7 +30,7 @@ query UserBooks($limit: Int!, $offset: Int!) {
     user_books(limit: $limit, offset: $offset, order_by: {id: asc}) {
       book_id status_id rating date_added updated_at private_notes review_raw
       book { title pages cached_image(path: "url") }
-      user_book_reads(order_by: {started_at: desc}) {
+      user_book_reads(order_by: {started_at: desc_nulls_last}) {
         started_at finished_at progress_pages
       }
     }
@@ -52,10 +54,17 @@ def get_stored_token(user):
     try:
         return tokens.require_user_token(user)
     except tokens.HardcoverTokenMissingError as error:
-        msg = (
-            "No Hardcover account connected. Save your Hardcover API token "
-            "under Settings > Integrations."
-        )
+        if HardcoverAccount.objects.filter(user=user).exists():
+            # Saved under a SECRET that has changed since
+            msg = (
+                "The saved Hardcover token can't be read anymore. Save it again "
+                "under Settings > Integrations."
+            )
+        else:
+            msg = (
+                "No Hardcover account connected. Save your Hardcover API token "
+                "under Settings > Integrations."
+            )
         raise MediaImportError(msg) from error
 
 
@@ -72,7 +81,7 @@ def _api_request(token, query, variables):
     """Send an authenticated GraphQL request to Hardcover."""
     authorization = token if token.startswith("Bearer ") else f"Bearer {token}"
     try:
-        return services.api_request(
+        response = services.api_request(
             Sources.HARDCOVER.value,
             "POST",
             HARDCOVER_API_URL,
@@ -83,6 +92,14 @@ def _api_request(token, query, variables):
         if error.response.status_code == requests.codes.unauthorized:
             raise MediaImportError(INVALID_TOKEN_MESSAGE) from error
         raise
+
+    # Fork: GraphQL errors come with status 200; don't report them as 0 books
+    errors = response.get("errors")
+    if errors:
+        message = errors[0].get("message") or "unknown error"
+        msg = f"Hardcover returned an error: {message}"
+        raise MediaImportError(msg)
+    return response
 
 
 def _get_current_user(response):
@@ -158,11 +175,14 @@ class HardcoverImporter:
             return
 
         media_id = str(user_book["book_id"])
+        # Fork: keep an existing cover when Hardcover has none for the book
+        image = self._get_image(book)
         item, _ = app.models.Item.objects.update_or_create(
             media_id=media_id,
             source=Sources.HARDCOVER.value,
             media_type=MediaTypes.BOOK.value,
-            defaults={"title": title, "image": self._get_image(book)},
+            defaults={"title": title, **({"image": image} if image else {})},
+            create_defaults={"title": title, "image": image or settings.IMG_NONE},
         )
         if not helpers.should_process_media(
             self.existing_media,

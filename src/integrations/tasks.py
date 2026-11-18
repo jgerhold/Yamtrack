@@ -168,6 +168,9 @@ def import_goodreads(file, user_id, mode):
 
 
 @shared_task(name="Import from Hardcover")
-def import_hardcover(token, user_id, mode):
-    """Celery task for importing books from Hardcover."""
+def import_hardcover(token, user_id, mode, username=None):  # noqa: ARG001
+    """Celery task for importing books from Hardcover.
+
+    username is only passed by scheduled imports (create_import_schedule).
+    """
     return import_media(hardcover.importer, token, user_id, mode)

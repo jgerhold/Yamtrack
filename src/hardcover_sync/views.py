@@ -1,5 +1,6 @@
 import logging
 
+import requests
 from django.contrib import messages
 from django.shortcuts import redirect
 from django.utils.translation import gettext as _
@@ -21,7 +22,16 @@ def save_token(request):
 
     try:
         username = hardcover.get_username(normalize_token(token))
+    except requests.exceptions.RequestException:
+        logger.exception("Could not reach Hardcover to check a token")
+        messages.error(
+            request,
+            _("Could not reach Hardcover to check the token. Please try again."),
+        )
+        return redirect("integrations")
     except services.ProviderAPIError:
+        username = None
+    if not username:
         messages.error(
             request,
             _(
@@ -35,13 +45,13 @@ def save_token(request):
     if account is None:
         account = HardcoverAccount(user=request.user)
     account.set_token(token)
-    account.username = username or ""
+    account.username = username
     account.save()
 
     logger.info("%s connected Hardcover account %s", request.user, username)
     messages.success(
         request,
-        _("Connected to Hardcover as %(username)s.") % {"username": username or "?"},
+        _("Connected to Hardcover as %(username)s.") % {"username": username},
     )
     return redirect("integrations")
 
