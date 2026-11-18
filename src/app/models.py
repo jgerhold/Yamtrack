@@ -286,9 +286,11 @@ class MediaManager(models.Manager):
                 if sort_filter == release_sorts.RELEASE_NEWEST
                 else release_order.asc(nulls_last=True)
             )
+            # id keeps the order stable across the infinite-scroll pages
             return queryset.order_by(
                 release_order,
                 models.functions.Lower("item__title"),
+                "id",
             )
 
         if sort_filter:
