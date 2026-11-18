@@ -5,6 +5,7 @@ import logging
 import secrets
 from urllib.parse import urlencode
 
+import requests
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_not_required
@@ -19,8 +20,10 @@ from django.views.decorators.http import require_GET, require_POST
 
 import users
 from app import helpers as app_helpers
+from hardcover_sync.models import HardcoverAccount
 from integrations import exports, tasks
-from integrations.imports import anilist, helpers, simkl, trakt
+from integrations.imports import anilist, hardcover, helpers, simkl, trakt
+from integrations.imports.helpers import MediaImportError
 from integrations.webhooks import emby, jellyfin, plex
 
 logger = logging.getLogger(__name__)
@@ -448,6 +451,80 @@ def import_steam(request):
             frequency,
             import_time,
             "Steam",
+        )
+    return redirect("import_data")
+
+
+@require_POST
+def import_hardcover(request):
+    """Validate a Hardcover token and queue or schedule a book import."""
+    token = request.POST.get("token", "").strip()
+    # Fork: without a pasted token, import with the account saved in Settings
+    account = HardcoverAccount.objects.filter(user=request.user).first()
+    if not token and account:
+        return import_hardcover_with_saved_account(request, account)
+    if not token:
+        messages.error(request, "Hardcover API token is required.")
+        return redirect("import_data")
+
+    try:
+        username = hardcover.get_username(token)
+    except MediaImportError as error:
+        messages.error(request, str(error))
+        return redirect("import_data")
+    except requests.exceptions.HTTPError:
+        messages.error(request, "Could not validate Hardcover token. Please try again.")
+        return redirect("import_data")
+
+    encrypted_token = helpers.encrypt(token)
+    mode = request.POST["mode"]
+    frequency = request.POST["frequency"]
+    if frequency == "once":
+        tasks.import_hardcover.delay(
+            token=encrypted_token,
+            user_id=request.user.id,
+            mode=mode,
+        )
+        messages.info(
+            request,
+            "The task to import books from Hardcover has been queued.",
+        )
+    else:
+        helpers.create_import_schedule(
+            username,
+            request,
+            mode,
+            frequency,
+            request.POST["time"],
+            "Hardcover",
+            task_kwargs={"token": encrypted_token},
+        )
+    return redirect("import_data")
+
+
+def import_hardcover_with_saved_account(request, account):
+    """Queue or schedule a Hardcover import with the user's saved token.
+
+    The task gets no token: the importer reads the saved one when it runs, so a
+    schedule follows token changes and stops working once the token is removed.
+    """
+    mode = request.POST["mode"]
+    frequency = request.POST["frequency"]
+    if frequency == "once":
+        tasks.import_hardcover.delay(token=None, user_id=request.user.id, mode=mode)
+        messages.info(
+            request,
+            _("The task to import books from Hardcover has been queued."),
+        )
+    else:
+        helpers.create_import_schedule(
+            account.username or request.user.username,
+            request,
+            mode,
+            frequency,
+            request.POST["time"],
+            "Hardcover",
+            task_kwargs={"token": None},
         )
     return redirect("import_data")
 

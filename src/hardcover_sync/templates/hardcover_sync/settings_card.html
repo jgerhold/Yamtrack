@@ -1,0 +1,51 @@
+{% load i18n %}
+{# Hardcover token card on the integrations settings page (fork: hardcover_sync) #}
+<div class="bg-[#2a2f35] rounded-lg p-6">
+  <div class="flex items-center mb-4">
+    {% include "app/icons/book-open.svg" with classes="w-6 h-6 text-indigo-400 mr-3" %}
+    <h2 class="text-xl font-semibold">Hardcover</h2>
+  </div>
+  <p class="text-gray-400 mb-5 text-sm">
+    {% blocktrans trimmed %}
+      With your own Hardcover API token, all book searches and book pages use your Hardcover account. Without one, Yamtrack's shared token is used for them.
+    {% endblocktrans %}
+    <a href="https://hardcover.app/account/api"
+       target="_blank"
+       rel="noopener noreferrer"
+       class="text-indigo-400 hover:text-indigo-300">{% trans "Get your token" %}</a>
+  </p>
+  {% with account=request.user.hardcover_account %}
+    {% if account %}
+      <div class="flex flex-wrap justify-between items-center gap-3">
+        <p class="text-sm text-gray-200">
+          {% blocktrans trimmed with username=account.username|default:"?" %}
+            Connected as <span class="font-semibold">{{ username }}</span>
+          {% endblocktrans %}
+        </p>
+        <form method="post" action="{% url 'hardcover_remove_token' %}">
+          {% csrf_token %}
+          <button type="submit"
+                  class="px-4 py-2 bg-[#39404b] text-gray-200 rounded-md hover:bg-[#454d5a] transition-colors text-sm cursor-pointer">
+            {% trans "Remove token" %}
+          </button>
+        </form>
+      </div>
+    {% endif %}
+    <form method="post"
+          action="{% url 'hardcover_save_token' %}"
+          class="flex flex-col sm:flex-row gap-3 {% if account %}mt-4{% endif %}">
+      {% csrf_token %}
+      <input type="password"
+             name="token"
+             autocomplete="off"
+             required
+             placeholder="{% if account %}{% trans 'Replace token' %}{% else %}{% trans 'Hardcover API token' %}{% endif %}"
+             aria-label="{% trans 'Hardcover API token' %}"
+             class="flex-1 py-2 px-3 bg-[#39404b] rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono">
+      <button type="submit"
+              class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
+        {% trans "Save token" %}
+      </button>
+    </form>
+  {% endwith %}
+</div>
