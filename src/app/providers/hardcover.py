@@ -102,18 +102,22 @@ def graphql_request(query, variables):
 def parse_search_filters(query):
     """Split a search query into free text and field filters.
 
-    Supports ``author:"Blake Crouch"`` and ``series:"Wayward Pines"`` (quotes are
-    optional for single words). Returns a tuple of (text, filters), where filters
-    is a list of (search field, value) tuples in the order they appeared.
+    Supports ``author:"Blake Crouch"`` and ``series:"Wayward Pines"``. A quoted
+    value must match the whole name (case-insensitive), an unquoted word matches
+    any name containing it, e.g. ``author:crouch``. Returns a tuple of
+    (text, filters), where filters is a list of (search field, value, exact)
+    tuples in the order they appeared.
     """
     filters = []
 
     def collect(match):
-        value = match.group(2) if match.group(2) is not None else match.group(3)
+        exact = match.group(2) is not None
+        value = match.group(2) if exact else match.group(3)
         # Backticks delimit values in Typesense filters, so they can't be escaped
         value = value.strip().strip('"').replace("`", "").strip()
         if value:
-            filters.append((SEARCH_FILTER_FIELDS[match.group(1).lower()], value))
+            field = SEARCH_FILTER_FIELDS[match.group(1).lower()]
+            filters.append((field, value, exact))
         return " "
 
     text = SEARCH_FILTER_PATTERN.sub(collect, str(query or ""))
@@ -121,8 +125,13 @@ def parse_search_filters(query):
 
 
 def build_filter_by(filters):
-    """Build a Typesense filter_by expression from parsed search filters."""
-    return " && ".join(f"{field}:=[`{value}`]" for field, value in filters)
+    """Build a Typesense filter_by expression from parsed search filters.
+
+    ``:=`` matches the whole value, ``:`` matches values containing the words.
+    """
+    return " && ".join(
+        f"{field}:{'=' if exact else ''}[`{value}`]" for field, value, exact in filters
+    )
 
 
 def search(query, page):
@@ -132,6 +141,10 @@ def search(query, page):
     ``author:"Blake Crouch"`` or ``dark series:"Wayward Pines"``.
     """
     text, filters = parse_search_filters(query)
+    if not text and not filters:
+        # Only empty filters like author:"" — don't send "*" and list every book
+        return helpers.format_search_response(page, settings.PER_PAGE, 0, [])
+
     query = cap_search_query(text)
     filter_by = build_filter_by(filters) or None
 
@@ -170,7 +183,7 @@ def search(query, page):
             "page": page,
             "filter_by": filter_by,
             # Without text there is no relevance, so show the most read books first
-            "sort": "users_count:desc" if filter_by else None,
+            "sort": "users_count:desc" if filter_by and not query else None,
         }
 
         response = graphql_request(search_query, variables)
@@ -289,9 +302,13 @@ def book(media_id):
             },
             # Detail values that link to a search, keyed by detail then value
             "detail_links": {
-                "author": {name: search_filter("author", name) for name in authors},
+                "author": {
+                    name: helpers.search_filter_query("author", name)
+                    for name in authors
+                },
                 "series": {
-                    label: search_filter("series", name) for label, name in series
+                    label: helpers.search_filter_query("series", name)
+                    for label, name in series
                 },
             },
         }
@@ -299,11 +316,6 @@ def book(media_id):
         cache.set(cache_key, data)
 
     return data
-
-
-def search_filter(field, value):
-    """Return the search query that filters books by a field value."""
-    return f'{field}:"{value}"'
 
 
 def get_authors(contributions):

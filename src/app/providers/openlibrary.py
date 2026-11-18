@@ -199,7 +199,10 @@ async def async_book(media_id):
             },
             # Open Library search supports author:"..." natively
             "detail_links": {
-                "author": {name: f'author:"{name}"' for name in authors or []},
+                "author": {
+                    name: helpers.search_filter_query("author", name)
+                    for name in authors or []
+                },
             },
         }
 

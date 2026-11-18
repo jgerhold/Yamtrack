@@ -6,7 +6,7 @@ from django.urls import reverse
 from django.utils import timezone, translation
 from django.utils.translation import pgettext
 
-from app import config
+from app import config, helpers
 from app.models import Item, MediaTypes, Sources
 from app.templatetags import app_tags
 
@@ -622,4 +622,15 @@ class AppTagsTests(TestCase):
         self.assertEqual(
             app_tags.detail_search_url({"media_type": "movie"}, "author", "x"),
             "",
+        )
+
+    def test_search_filter_query(self):
+        """Test filter terms quote the value and drop inner double quotes."""
+        self.assertEqual(
+            helpers.search_filter_query("author", "Blake Crouch"),
+            'author:"Blake Crouch"',
+        )
+        self.assertEqual(
+            helpers.search_filter_query("author", 'Dwayne "The Rock" Johnson'),
+            'author:"Dwayne The Rock Johnson"',
         )

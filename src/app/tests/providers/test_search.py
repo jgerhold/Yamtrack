@@ -350,20 +350,64 @@ class Search(TestCase):
         self.assertEqual(response["results"], [])
         self.assertEqual(response["total_results"], 0)
 
+    def test_hardcover_build_filter_by(self):
+        """Test exact filters use := and word filters use :."""
+        self.assertEqual(
+            hardcover.build_filter_by(
+                [
+                    ("author_names", "Blake Crouch", True),
+                    ("series_names", "pines", False),
+                ],
+            ),
+            "author_names:=[`Blake Crouch`] && series_names:[`pines`]",
+        )
+
+    @patch("app.providers.hardcover.services.api_request")
+    def test_hardcover_text_with_filter_keeps_relevance(self, mock_api_request):
+        """Test free text with a filter is not re-sorted by popularity."""
+        mock_api_request.return_value = {
+            "data": {"search": {"results": {"hits": [], "found": 0}}},
+        }
+        cache.clear()
+
+        hardcover.search('dark author:"Blake Crouch"', 1)
+
+        _, kwargs = mock_api_request.call_args
+        variables = kwargs["params"]["variables"]
+        self.assertEqual(variables["query"], "dark")
+        self.assertIsNone(variables["sort"])
+
+    @patch("app.providers.hardcover.services.api_request")
+    def test_hardcover_empty_filter_returns_nothing(self, mock_api_request):
+        """Test an empty filter does not list the whole catalogue."""
+        response = hardcover.search('author:""', 1)
+
+        mock_api_request.assert_not_called()
+        self.assertEqual(response["results"], [])
+        self.assertEqual(response["total_results"], 0)
+
+    def test_hardcover_author_word_filter(self):
+        """Test an unquoted word matches authors whose name contains it."""
+        response = hardcover.search("author:crouch", 1)
+        titles = [book["title"] for book in response["results"]]
+
+        self.assertIn("Dark Matter", titles)
+
     def test_hardcover_parse_search_filters(self):
         """Test filters are split from the free text of a query."""
         cases = {
-            'author:"Blake Crouch"': ("", [("author_names", "Blake Crouch")]),
-            "pines author:crouch": ("pines", [("author_names", "crouch")]),
+            # Quoted values match the whole name, unquoted words any name with them
+            'author:"Blake Crouch"': ("", [("author_names", "Blake Crouch", True)]),
+            "pines author:crouch": ("pines", [("author_names", "crouch", False)]),
             'Series:"Wayward Pines" dark': (
                 "dark",
-                [("series_names", "Wayward Pines")],
+                [("series_names", "Wayward Pines", True)],
             ),
             "dark matter": ("dark matter", []),
             # Not a filter: no keyword at a word boundary, or an empty value
             "coauthor:x": ("coauthor:x", []),
             'author:""': ("", []),
-            "author:`Bad`Name": ("", [("author_names", "BadName")]),
+            "author:`Bad`Name": ("", [("author_names", "BadName", False)]),
         }
 
         for query, expected in cases.items():

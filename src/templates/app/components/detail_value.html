@@ -1,0 +1,11 @@
+{% load app_tags %}
+{# One value of a media's details; linked to a search when the provider declares one #}
+{% detail_search_url media key value as search_url %}
+{% if search_url %}
+  <p>
+    <a href="{{ search_url }}"
+       class="hover:text-indigo-400 transition-colors duration-200">{{ value }}</a>
+  </p>
+{% else %}
+  <p>{{ value|default_if_none:unknown_label|iso_date_format:request.user }}</p>
+{% endif %}
