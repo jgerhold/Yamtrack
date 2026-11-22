@@ -12,6 +12,7 @@ are written without signals and history, so they are not pushed back.
 A book removed on Hardcover is only unlinked, never deleted in Yamtrack.
 """
 
+import datetime
 import logging
 
 from django.apps import apps
@@ -43,11 +44,14 @@ class SyncRun:
         self.user = user
         self.dry_run = dry_run
         self.token = tokens.require_user_token(user)
+        self.started_at = timezone.now()
         self.changes = 0
+        self.failures = 0
 
     def log(self, direction, action, title, details="", *, failed=False):
         """Record one change (or planned change in a dry run)."""
         self.changes += not failed
+        self.failures += failed
         HardcoverSyncLog.objects.create(
             user=self.user,
             direction=direction,
@@ -138,15 +142,30 @@ def push_book(run, media_id, remote=None, *, remote_known=False):
         return
 
     title = entries[-1].item.title
+    changes_before = run.changes
     user_book_id = push_library_entry(run, media_id, title, entries[-1], remote)
     read_ids = push_reads(run, title, entries, remote, user_book_id, link)
+    if run.dry_run:
+        return
 
-    if not run.dry_run:
-        HardcoverBookLink.objects.update_or_create(
-            user=run.user,
-            media_id=media_id,
-            defaults={"user_book_id": user_book_id, "read_ids": read_ids},
-        )
+    # Remember Hardcover's updated_at as of our own change, so the next sync
+    # doesn't take our push for a change made on Hardcover
+    if run.changes > changes_before:
+        remote = client.fetch_user_book(run.token, media_id)
+    HardcoverBookLink.objects.update_or_create(
+        user=run.user,
+        media_id=media_id,
+        defaults={
+            "user_book_id": user_book_id,
+            "read_ids": read_ids,
+            "remote_updated_at": remote_updated_at(remote),
+        },
+    )
+
+
+def remote_updated_at(user_book):
+    """Return when Hardcover last changed a library entry, or None."""
+    return parse_datetime((user_book or {}).get("updated_at") or "")
 
 
 def push_removal(run, media_id, remote, link):
@@ -209,6 +228,11 @@ def push_reads(run, title, entries, remote, user_book_id, link):
         key = str(entry.id)
         desired = mapping.read_fields(entry)
         if desired is None:
+            if key in read_ids:
+                read_id = read_ids.pop(key)
+                if not run.dry_run:
+                    client.delete_read(run.token, read_id)
+                run.log(Direction.TO_HARDCOVER, "removed read", title, "no dates")
             continue
         if key not in read_ids:
             if not run.dry_run:
@@ -294,51 +318,74 @@ def pull_new_book(run, user_book, status):
             "image": book.get("cached_image") or settings.IMG_NONE,
         },
     )
-    # bulk_create sends no post_save, so the new entry isn't pushed back
+    # bulk_create sends no post_save, so the new entry isn't pushed back now
     entry = bulk_create_with_history([Book(item=item, user=run.user, **fields)], Book)[
         0
     ]
+    # Date its history at the Hardcover change, before this sync started, so
+    # the next sync doesn't count it as a Yamtrack change and push it back
+    changed_at = remote_updated_at(user_book) or run.started_at
+    changed_at = min(changed_at, run.started_at - datetime.timedelta(seconds=1))
+    apps.get_model("app", "HistoricalBook").objects.filter(id=entry.pk).update(
+        history_date=changed_at,
+    )
     read_ids = {}
     if latest_read.get("id") and entry.pk:
         read_ids[str(entry.pk)] = latest_read["id"]
     HardcoverBookLink.objects.update_or_create(
         user=run.user,
         media_id=media_id,
-        defaults={"user_book_id": user_book["id"], "read_ids": read_ids},
+        defaults={
+            "user_book_id": user_book["id"],
+            "read_ids": read_ids,
+            "remote_updated_at": remote_updated_at(user_book),
+        },
     )
 
 
 def pull_changes(run, user_book, status, entries):
     """Apply a newer Hardcover change to the newest Yamtrack entry."""
     latest = entries[-1]
-    desired = {
-        "status": status,
-        "score": mapping.rating_to_score(user_book.get("rating")),
-        "notes": user_book.get("private_notes") or "",
-    }
+    desired = {"status": status, "notes": user_book.get("private_notes") or ""}
+    remote_rating = mapping.remote_library_fields(user_book)["rating"]
+    # Half stars can't hold every score: keep a local score that maps to them
+    if mapping.score_to_rating(latest.score) != remote_rating:
+        desired["score"] = mapping.rating_to_score(remote_rating)
+
     read = linked_read(run.user, user_book, latest)
     if read:
-        desired.update(
-            {
-                "progress": read.get("progress_pages") or latest.progress,
-                "start_date": mapping.from_date(read.get("started_at"))
-                or latest.start_date,
-                "end_date": mapping.from_date(read.get("finished_at"))
-                or latest.end_date,
-            },
-        )
+        # Dates cleared on Hardcover are cleared here too. Hardcover often has
+        # no page count for finished reads, so a missing one keeps ours.
+        desired["start_date"] = mapping.from_date(read.get("started_at"))
+        desired["end_date"] = mapping.from_date(read.get("finished_at"))
+        if read.get("progress_pages") is not None:
+            desired["progress"] = read["progress_pages"]
+
     changes = {
         key: value
         for key, value in desired.items()
         if not same_value(getattr(latest, key), value)
     }
-    if not changes:
+    if changes:
+        run.log(
+            Direction.FROM_HARDCOVER,
+            "updated",
+            latest.item.title,
+            describe(changes),
+        )
+    if run.dry_run:
         return
-
-    run.log(Direction.FROM_HARDCOVER, "updated", latest.item.title, describe(changes))
-    if not run.dry_run:
+    if changes:
         # update() sends no signals and writes no history: not pushed back
         Book.objects.filter(pk=latest.pk).update(**changes)
+    HardcoverBookLink.objects.update_or_create(
+        user=run.user,
+        media_id=str(user_book["book_id"]),
+        defaults={
+            "user_book_id": user_book["id"],
+            "remote_updated_at": remote_updated_at(user_book),
+        },
+    )
 
 
 def linked_read(user, user_book, entry):
@@ -356,7 +403,7 @@ def linked_read(user, user_book, entry):
 
 
 def same_value(current, new):
-    """Compare a Yamtrack field with a value from Hardcover."""
+    """Compare a Yamtrack field with a value from Hardcover (dates by day)."""
     if hasattr(current, "date") and hasattr(new, "date"):
         return timezone.localtime(current).date() == timezone.localtime(new).date()
     return current == new
@@ -374,7 +421,6 @@ def sync_user(user):
     if account.sync_mode == SyncMode.OFF:
         return 0
     run = SyncRun(user, dry_run=account.sync_mode == SyncMode.DRY_RUN)
-    started_at = timezone.now()
     since = account.last_synced_at
 
     library = {
@@ -385,8 +431,9 @@ def sync_user(user):
     unlink_removed(run, library)
     push_local_changes(run, library, since, pulled)
 
-    if not run.dry_run:
-        account.last_synced_at = started_at
+    # After a failure keep the old time, so the failed books are retried
+    if not run.dry_run and not run.failures:
+        account.last_synced_at = run.started_at
         account.save(update_fields=["last_synced_at"])
     HardcoverSyncLog.prune(user)
     return run.changes
@@ -395,16 +442,23 @@ def sync_user(user):
 def pull_library(run, library, since):
     """Apply Hardcover additions and newer changes; return the pulled ids."""
     pulled = set()
+    links = {
+        link.media_id: link for link in HardcoverBookLink.objects.filter(user=run.user)
+    }
     for media_id, user_book in library.items():
         status = mapping.HARDCOVER_TO_STATUS.get(user_book.get("status_id"))
         if status is None:
             continue
+        link = links.get(media_id)
         try:
             entries = book_entries(run.user, media_id)
             if not entries:
-                pull_new_book(run, user_book, status)
-                pulled.add(media_id)
-            elif remote_is_newer(user_book, entries, since):
+                # A linked book without entries was deleted in Yamtrack: the
+                # push step removes it on Hardcover instead of adding it back
+                if link is None:
+                    pull_new_book(run, user_book, status)
+                    pulled.add(media_id)
+            elif remote_is_newer(user_book, entries, since, link):
                 pull_changes(run, user_book, status, entries)
                 pulled.add(media_id)
         except Exception as error:
@@ -414,13 +468,17 @@ def pull_library(run, library, since):
     return pulled
 
 
-def remote_is_newer(user_book, entries, since):
-    """Return whether Hardcover changed the book after the last sync and Yamtrack."""
-    remote_changed = parse_datetime(user_book.get("updated_at") or "")
+def remote_is_newer(user_book, entries, since, link):
+    """Return whether the user changed the book on Hardcover since we last saw it.
+
+    The change must also be newer than the last Yamtrack change of the book.
+    """
+    remote_changed = remote_updated_at(user_book)
     if remote_changed is None:
         return False
+    seen = link.remote_updated_at if link and link.remote_updated_at else since
     local_changed = last_local_change(entries)
-    return (since is None or remote_changed > since) and (
+    return (seen is None or remote_changed > seen) and (
         local_changed is None or remote_changed > local_changed
     )
 

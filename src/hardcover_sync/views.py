@@ -8,7 +8,12 @@ from django.views.decorators.http import require_POST
 
 from app.providers import hardcover, services
 from hardcover_sync import tasks
-from hardcover_sync.models import HardcoverAccount, SyncMode, normalize_token
+from hardcover_sync.models import (
+    HardcoverAccount,
+    HardcoverBookLink,
+    SyncMode,
+    normalize_token,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,9 @@ def save_token(request):
     account = HardcoverAccount.objects.filter(user=request.user).first()
     if account is None:
         account = HardcoverAccount(user=request.user)
+    elif account.username != username:
+        # Another Hardcover account: its library needs a full first sync
+        reset_sync_state(request.user, account)
     account.set_token(token)
     account.username = username
     account.save()
@@ -60,10 +68,17 @@ def save_token(request):
 @require_POST
 def remove_token(request):
     """Forget the user's Hardcover token."""
+    HardcoverBookLink.objects.filter(user=request.user).delete()
     deleted, _details = HardcoverAccount.objects.filter(user=request.user).delete()
     if deleted:
         messages.success(request, _("Hardcover token removed."))
     return redirect("integrations")
+
+
+def reset_sync_state(user, account):
+    """Forget what was synced, so the next sync starts like the first one."""
+    HardcoverBookLink.objects.filter(user=user).delete()
+    account.last_synced_at = None
 
 
 @require_POST
@@ -71,8 +86,11 @@ def save_sync_mode(request):
     """Turn the two-way Hardcover sync off, to dry run, or on."""
     account = HardcoverAccount.objects.filter(user=request.user).first()
     mode = request.POST.get("sync_mode")
-    if account is None or mode not in SyncMode.values:
+    if account is None:
         messages.error(request, _("Save your Hardcover token first."))
+        return redirect("integrations")
+    if mode not in SyncMode.values:
+        messages.error(request, _("Unknown sync mode."))
         return redirect("integrations")
 
     account.sync_mode = mode

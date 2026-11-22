@@ -443,3 +443,226 @@ class SyncViewTests(SyncTestCase):
         self.assertContains(response, "Sync with Hardcover")
         self.assertContains(response, "Pines")
         self.assertContains(response, "dry run")
+
+
+class ReviewRegressionTests(SyncTestCase):
+    """Regression tests for the sync review findings."""
+
+    @patch(f"{CLIENT}.delete_user_book")
+    @patch(f"{CLIENT}.fetch_library")
+    def test_book_deleted_here_is_removed_there_not_pulled_back(
+        self,
+        fetch_library,
+        delete_book,
+    ):
+        """A linked book without entries is removed on Hardcover, not re-added."""
+        HardcoverBookLink.objects.create(
+            user=self.user, media_id="41", user_book_id=941
+        )
+        self.account.last_synced_at = timezone.now()
+        self.account.save()
+        fetch_library.return_value = [remote_book(41)]
+
+        sync.sync_user(self.user)
+
+        self.assertFalse(Book.objects.filter(item__media_id="41").exists())
+        delete_book.assert_called_once_with("Bearer own-token", 941)
+
+    @patch(f"{CLIENT}.update_user_book")
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_push_remembers_hardcovers_time_of_our_change(self, fetch, _update):
+        """After a push the link stores Hardcover's new updated_at."""
+        self.add_entry("42", status=Status.DROPPED.value)
+        fetch.side_effect = [
+            remote_book(42, status_id=2, updated_at="2026-01-01T00:00:00+00:00"),
+            remote_book(42, status_id=5, updated_at="2026-04-01T10:00:00+00:00"),
+        ]
+
+        sync.push_book(self.run_sync(), "42")
+
+        link = HardcoverBookLink.objects.get(media_id="42")
+        self.assertEqual(
+            link.remote_updated_at.isoformat(), "2026-04-01T10:00:00+00:00"
+        )
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_own_push_is_not_pulled_back(self, fetch_library):
+        """A Hardcover entry unchanged since our push isn't taken as new."""
+        entry = self.add_entry(
+            "43",
+            changed_at=local_datetime(2026, 4, 1, 9),
+            score=Decimal("7.3"),
+        )
+        HardcoverBookLink.objects.create(
+            user=self.user,
+            media_id="43",
+            user_book_id=943,
+            remote_updated_at=datetime.datetime(2026, 4, 1, 10, tzinfo=datetime.UTC),
+        )
+        self.account.last_synced_at = local_datetime(2026, 1, 1)
+        self.account.save()
+        fetch_library.return_value = [
+            remote_book(43, rating=3.5, updated_at="2026-04-01T10:00:00+00:00"),
+        ]
+
+        sync.sync_user(self.user)
+
+        entry.refresh_from_db()
+        self.assertEqual(entry.score, Decimal("7.3"))
+        self.assertFalse(HardcoverSyncLog.objects.filter(direction="pull").exists())
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_rounded_rating_keeps_the_finer_score(self, fetch_library):
+        """A Hardcover change keeps a local score that maps to the same stars."""
+        entry = self.add_entry(
+            "44",
+            changed_at=local_datetime(2026, 1, 1),
+            score=Decimal("7.3"),
+            status=Status.IN_PROGRESS.value,
+        )
+        fetch_library.return_value = [
+            remote_book(44, rating=3.5, status_id=3, updated_at="2026-02-01T00:00:00Z"),
+        ]
+
+        sync.sync_user(self.user)
+
+        entry.refresh_from_db()
+        self.assertEqual(entry.status, Status.COMPLETED.value)
+        self.assertEqual(entry.score, Decimal("7.3"))
+
+    @patch(f"{CLIENT}.update_user_book", side_effect=RuntimeError("Hardcover down"))
+    @patch(f"{CLIENT}.fetch_library")
+    def test_failure_keeps_last_sync_time(self, fetch_library, _update):
+        """After a failed book the old sync time stays, so it is retried."""
+        self.add_entry("45", status=Status.DROPPED.value)
+        fetch_library.return_value = [remote_book(45, status_id=2)]
+
+        sync.sync_user(self.user)
+
+        self.account.refresh_from_db()
+        self.assertIsNone(self.account.last_synced_at)
+        self.assertTrue(HardcoverSyncLog.objects.get(failed=True))
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_pulled_book_is_not_pushed_next_time(self, fetch_library):
+        """A book added from Hardcover doesn't count as a Yamtrack change later."""
+        fetch_library.return_value = [remote_book(46)]
+        sync.sync_user(self.user)
+        self.account.refresh_from_db()
+
+        self.assertNotIn(
+            "46",
+            sync.local_changes_since(self.user, self.account.last_synced_at),
+        )
+
+    @patch(f"{CLIENT}.delete_read")
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_cleared_dates_remove_the_hardcover_session(self, fetch, delete_read):
+        """An entry without dates or pages no longer has a Hardcover session."""
+        entry = self.add_entry("47", status=Status.PLANNING.value)
+        HardcoverBookLink.objects.create(
+            user=self.user,
+            media_id="47",
+            user_book_id=947,
+            read_ids={str(entry.id): 61},
+        )
+        fetch.return_value = remote_book(
+            47,
+            status_id=1,
+            rating=4.0,
+            user_book_reads=[
+                {
+                    "id": 61,
+                    "started_at": "2026-01-01",
+                    "finished_at": None,
+                    "progress_pages": 10,
+                },
+            ],
+        )
+
+        sync.push_book(self.run_sync(), "47")
+
+        delete_read.assert_called_once_with("Bearer own-token", 61)
+        self.assertEqual(HardcoverBookLink.objects.get(media_id="47").read_ids, {})
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_date_cleared_on_hardcover_is_cleared_here(self, fetch_library):
+        """A finish date removed on Hardcover is removed in Yamtrack too."""
+        entry = self.add_entry(
+            "48",
+            changed_at=local_datetime(2026, 1, 1),
+            start_date=local_datetime(2025, 12, 1, 12),
+            end_date=local_datetime(2025, 12, 20, 12),
+        )
+        fetch_library.return_value = [
+            remote_book(
+                48,
+                updated_at="2026-02-01T00:00:00Z",
+                user_book_reads=[
+                    {
+                        "id": 62,
+                        "started_at": "2025-12-01",
+                        "finished_at": None,
+                        "progress_pages": None,
+                    },
+                ],
+            ),
+        ]
+
+        sync.sync_user(self.user)
+
+        entry.refresh_from_db()
+        self.assertIsNone(entry.end_date)
+        self.assertIsNotNone(entry.start_date)
+
+
+class TaskLockTests(SyncTestCase):
+    """A push and a full sync never run at the same time for a user."""
+
+    def setUp(self):
+        """Start without locks."""
+        super().setUp()
+        from django.core.cache import cache  # noqa: PLC0415
+
+        from hardcover_sync import tasks  # noqa: PLC0415
+
+        self.cache = cache
+        self.tasks = tasks
+        cache.delete(tasks.user_lock_key(self.user.id))
+
+    def test_push_waits_for_a_running_sync(self):
+        """A push while a sync holds the lock is retried later."""
+        from celery.exceptions import Retry  # noqa: PLC0415
+
+        self.cache.add(self.tasks.user_lock_key(self.user.id), 1)
+        try:
+            with (
+                patch(f"{CLIENT}.fetch_user_book") as fetch,
+                self.assertRaises(Retry),
+            ):
+                self.tasks.push_book.apply(args=[self.user.id, "51"], throw=True)
+            fetch.assert_not_called()
+        finally:
+            self.cache.delete(self.tasks.user_lock_key(self.user.id))
+
+    def test_second_sync_is_skipped(self):
+        """A sync started while another runs returns without work."""
+        self.cache.add(self.tasks.user_lock_key(self.user.id), 1)
+        try:
+            with patch(f"{CLIENT}.fetch_library") as fetch_library:
+                result = self.tasks.sync_user(self.user.id)
+            fetch_library.assert_not_called()
+            self.assertIn("already running", result)
+        finally:
+            self.cache.delete(self.tasks.user_lock_key(self.user.id))
+
+    def test_unreadable_token_is_logged(self):
+        """A sync with a token that can't be decrypted shows up in the log."""
+        HardcoverAccount.objects.filter(pk=self.account.pk).update(
+            encrypted_token="not-decryptable",  # noqa: S106
+        )
+
+        result = self.tasks.sync_user(self.user.id)
+
+        self.assertIn("token missing", result)
+        self.assertTrue(HardcoverSyncLog.objects.get(failed=True))

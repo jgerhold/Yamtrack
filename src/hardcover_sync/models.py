@@ -88,6 +88,9 @@ class HardcoverBookLink(models.Model):
     user_book_id = models.IntegerField()
     # Yamtrack entry (Book.id) -> Hardcover user_book_reads.id, keys as strings
     read_ids = models.JSONField(default=dict, blank=True)
+    # Hardcover's updated_at after our last push or pull of the book: a later
+    # updated_at means the user changed it on Hardcover
+    remote_updated_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
