@@ -31,6 +31,9 @@
         </form>
       </div>
     {% endif %}
+    {% if account %}
+      {% include "hardcover_sync/sync_settings.html" %}
+    {% endif %}
     <form method="post"
           action="{% url 'hardcover_save_token' %}"
           class="flex flex-col sm:flex-row gap-3 {% if account %}mt-4{% endif %}">

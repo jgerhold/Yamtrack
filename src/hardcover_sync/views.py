@@ -7,7 +7,8 @@ from django.utils.translation import gettext as _
 from django.views.decorators.http import require_POST
 
 from app.providers import hardcover, services
-from hardcover_sync.models import HardcoverAccount, normalize_token
+from hardcover_sync import tasks
+from hardcover_sync.models import HardcoverAccount, SyncMode, normalize_token
 
 logger = logging.getLogger(__name__)
 
@@ -62,4 +63,38 @@ def remove_token(request):
     deleted, _details = HardcoverAccount.objects.filter(user=request.user).delete()
     if deleted:
         messages.success(request, _("Hardcover token removed."))
+    return redirect("integrations")
+
+
+@require_POST
+def save_sync_mode(request):
+    """Turn the two-way Hardcover sync off, to dry run, or on."""
+    account = HardcoverAccount.objects.filter(user=request.user).first()
+    mode = request.POST.get("sync_mode")
+    if account is None or mode not in SyncMode.values:
+        messages.error(request, _("Save your Hardcover token first."))
+        return redirect("integrations")
+
+    account.sync_mode = mode
+    account.save(update_fields=["sync_mode"])
+    messages.success(
+        request,
+        _("Hardcover sync: %(mode)s.") % {"mode": SyncMode(mode).label},
+    )
+    if mode != SyncMode.OFF:
+        tasks.sync_user.delay(request.user.id)
+        messages.info(request, _("A first sync has started. See the log below."))
+    return redirect("integrations")
+
+
+@require_POST
+def sync_now(request):
+    """Start a full Hardcover sync for the user."""
+    account = HardcoverAccount.objects.filter(user=request.user).first()
+    if account is None or account.sync_mode == SyncMode.OFF:
+        messages.error(request, _("Turn the Hardcover sync on or to dry run first."))
+        return redirect("integrations")
+
+    tasks.sync_user.delay(request.user.id)
+    messages.info(request, _("Hardcover sync started. Reload to see the log."))
     return redirect("integrations")

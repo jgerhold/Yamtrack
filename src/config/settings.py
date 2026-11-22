@@ -594,6 +594,11 @@ USER_MESSAGE_RETENTION_DAYS = config(
     cast=int,
 )
 CELERY_BEAT_SCHEDULE = {
+    # Fork: two-way Hardcover sync for users who turned it on
+    "hardcover_sync": {
+        "task": "Hardcover sync",
+        "schedule": 60 * 60 * 6,  # every 6 hours
+    },
     "reload_calendar": {
         "task": "Reload calendar",
         "schedule": 60 * 60 * 24,  # every 24 hours
