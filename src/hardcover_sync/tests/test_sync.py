@@ -55,6 +55,10 @@ class SyncTestCase(TestCase):
         )
         self.account.set_token("own-token")
         self.account.save()
+        # No book is merged on Hardcover unless a test says so
+        merged = patch(f"{CLIENT}.fetch_merged_books", return_value={})
+        self.fetch_merged = merged.start()
+        self.addCleanup(merged.stop)
 
     def add_entry(self, media_id, changed_at=None, **fields):
         """Create a Yamtrack book entry without save() side effects."""
@@ -666,3 +670,181 @@ class TaskLockTests(SyncTestCase):
 
         self.assertIn("token missing", result)
         self.assertTrue(HardcoverSyncLog.objects.get(failed=True))
+
+
+class MergedBookTests(SyncTestCase):
+    """Books merged on Hardcover sync with the edition they were merged into."""
+
+    def setUp(self):
+        """Forget cached editions of the books used here."""
+        super().setUp()
+        from django.core.cache import cache  # noqa: PLC0415
+
+        cache.delete_many(
+            [sync.edition_cache_key(media_id) for media_id in ("7001", "7101")],
+        )
+
+    @patch(f"{CLIENT}.insert_user_book", return_value=77)
+    @patch(f"{CLIENT}.fetch_user_book", return_value=None)
+    def test_merged_book_is_added_as_the_merged_into_edition(self, fetch, insert):
+        """A merged book is added with the id Hardcover accepts."""
+        self.add_entry("7001", status=Status.PLANNING.value)
+        self.fetch_merged.return_value = {"7001": "7002"}
+
+        sync.push_book(self.run_sync(), "7001")
+
+        self.assertEqual(fetch.call_args.args[1], ["7002", "7001"])
+        self.assertEqual(insert.call_args.args[1]["book_id"], 7002)
+        log = HardcoverSyncLog.objects.get(action="added")
+        self.assertEqual(log.title, "Book 7001")
+        self.assertIn("merged on Hardcover into book 7002", log.details)
+        self.assertTrue(
+            HardcoverBookLink.objects.filter(user=self.user, media_id="7001").exists(),
+        )
+
+    def test_merges_are_followed(self):
+        """A book merged twice syncs with the last edition."""
+        self.fetch_merged.side_effect = [{"7101": "7102"}, {"7102": "7103"}, {}]
+        run = self.run_sync()
+
+        sync.resolve_editions(run, ["7101"])
+
+        self.assertEqual(sync.hardcover_id(run, "7101"), "7103")
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_merged_edition_on_hardcover_is_not_pulled_as_new_book(
+        self,
+        fetch_library,
+    ):
+        """The library entry of the merged-into edition matches our book."""
+        self.add_entry("7001", changed_at=local_datetime(2025, 1, 1))
+        self.fetch_merged.return_value = {"7001": "7002"}
+        fetch_library.return_value = [
+            remote_book(7002, status_id=5, updated_at="2026-02-01T00:00:00+00:00"),
+        ]
+
+        sync.sync_user(self.user)
+
+        self.assertFalse(Item.objects.filter(media_id="7002").exists())
+        entry = Book.objects.get(user=self.user, item__media_id="7001")
+        self.assertEqual(entry.status, Status.DROPPED.value)
+        self.assertFalse(HardcoverSyncLog.objects.filter(failed=True).exists())
+
+    @patch(f"{CLIENT}.insert_user_book", side_effect=RuntimeError("refused"))
+    @patch(f"{CLIENT}.fetch_library", return_value=[])
+    def test_failure_log_names_the_book(self, _fetch_library, _insert):
+        """A failed push shows the book title, not its Hardcover id."""
+        self.add_entry("7201")
+
+        sync.sync_user(self.user)
+
+        self.assertEqual(HardcoverSyncLog.objects.get(failed=True).title, "Book 7201")
+
+
+class HardcoverMadeReadTests(SyncTestCase):
+    """Hardcover adds a session of its own when a book is marked as read."""
+
+    def made_read(self, book_id):
+        """Return the library entry right after Hardcover added its session."""
+        return remote_book(
+            book_id,
+            id=77,
+            user_book_reads=[
+                {
+                    "id": 600,
+                    "started_at": None,
+                    "finished_at": "2026-11-25",
+                    "progress_pages": 300,
+                },
+            ],
+        )
+
+    @patch(f"{CLIENT}.delete_read")
+    @patch(f"{CLIENT}.update_read")
+    @patch(f"{CLIENT}.insert_read")
+    @patch(f"{CLIENT}.insert_user_book", return_value=77)
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_hardcovers_session_gets_the_yamtrack_dates(
+        self,
+        fetch,
+        _insert_book,
+        insert_read,
+        update_read,
+        delete_read,
+    ):
+        """No second session: Hardcover's own one is changed to our dates."""
+        self.add_entry(
+            "81",
+            start_date=local_datetime(2025, 3, 1),
+            end_date=local_datetime(2025, 3, 9),
+            progress=300,
+        )
+        fetch.side_effect = [None, self.made_read(81), self.made_read(81)]
+
+        sync.push_book(self.run_sync(), "81")
+
+        insert_read.assert_not_called()
+        delete_read.assert_not_called()
+        read_id, fields = update_read.call_args.args[1:]
+        self.assertEqual(read_id, 600)
+        self.assertEqual(fields["started_at"], "2025-03-01")
+        self.assertEqual(fields["finished_at"], "2025-03-09")
+
+    @patch(f"{CLIENT}.delete_read")
+    @patch(f"{CLIENT}.insert_read")
+    @patch(f"{CLIENT}.insert_user_book", return_value=77)
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_hardcovers_session_is_removed_without_dates(
+        self,
+        fetch,
+        _insert_book,
+        insert_read,
+        delete_read,
+    ):
+        """A finished book without dates in Yamtrack gets no session at all."""
+        self.add_entry("82", progress=0)
+        fetch.side_effect = [None, self.made_read(82), self.made_read(82)]
+
+        sync.push_book(self.run_sync(), "82")
+
+        insert_read.assert_not_called()
+        delete_read.assert_called_once()
+        self.assertEqual(delete_read.call_args.args[1], 600)
+
+    @patch(f"{CLIENT}.delete_read")
+    @patch(f"{CLIENT}.update_user_book")
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_existing_sessions_are_kept(self, fetch, _update_book, delete_read):
+        """Sessions the user already had on Hardcover are never removed."""
+        self.add_entry("83", progress=0)
+        existing = self.made_read(83) | {"status_id": 2}
+        fetch.return_value = existing
+
+        sync.push_book(self.run_sync(), "83")
+
+        delete_read.assert_not_called()
+
+
+class StopTests(SyncTestCase):
+    """Switching the sync off stops a running sync between books."""
+
+    @patch(f"{CLIENT}.insert_user_book")
+    @patch(f"{CLIENT}.fetch_library", return_value=[])
+    def test_switching_off_stops_the_running_sync(self, _fetch_library, insert):
+        """After the first book the user switches to Off: nothing else is sent."""
+        self.add_entry("91", status=Status.PLANNING.value)
+        self.add_entry("92", status=Status.PLANNING.value)
+
+        def switch_off(*_args):
+            HardcoverAccount.objects.filter(pk=self.account.pk).update(
+                sync_mode=SyncMode.OFF,
+            )
+            return 77
+
+        insert.side_effect = switch_off
+        with patch(f"{CLIENT}.fetch_user_book", return_value=None):
+            sync.sync_user(self.user)
+
+        self.assertEqual(insert.call_count, 1)
+        self.account.refresh_from_db()
+        self.assertIsNone(self.account.last_synced_at)
