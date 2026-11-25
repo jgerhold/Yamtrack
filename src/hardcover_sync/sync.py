@@ -14,6 +14,7 @@ A book removed on Hardcover is only unlinked, never deleted in Yamtrack.
 
 import datetime
 import logging
+import time
 
 from django.apps import apps
 from django.conf import settings
@@ -40,6 +41,11 @@ Direction = HardcoverSyncLog.Direction
 EDITION_CACHE_TIMEOUT = 60 * 60 * 24
 # A merged book can be merged again; follow that many merges
 MAX_MERGE_HOPS = 3
+# Hardcover statuses that make it add a reading session (Currently Reading, Read)
+SESSION_STATUSES = {2, 3}
+# Hardcover shows a new session after a moment: look this often, this far apart
+READ_POLL_ATTEMPTS = 5
+READ_POLL_DELAY = 2
 
 
 class SyncRun:
@@ -259,26 +265,38 @@ def push_book(run, media_id, remote=None, *, remote_known=False):
     changes_before = run.changes
     reads_before = {read["id"] for read in (remote or {}).get("user_book_reads", [])}
     user_book_id, status_sent = push_library_entry(
-        run, media_id, title, entries[-1], remote
+        run, media_id, title, entries, remote
     )
-    made_by_hardcover = set()
+    made_by_hardcover = []
     fetched_after = None
     if status_sent and not run.dry_run:
-        # Setting a status can make Hardcover add a reading session of its own
-        # (marking a book as read adds one finished today). Fetch it, so
-        # push_reads fills it with the Yamtrack dates instead of adding another.
-        remote = fetch_remote(run, media_id)
+        # Setting a status can make Hardcover add a reading session of its own,
+        # dated with the status dates sent along. Fetch it, so push_reads takes
+        # it over instead of adding a second session.
+        status_id = mapping.library_fields(entries[-1])["status_id"]
+        remote, made_by_hardcover = fetch_made_reads(
+            run,
+            media_id,
+            reads_before,
+            wait=status_id in SESSION_STATUSES,
+        )
+        user_book_id = user_book_id or (remote or {}).get("id")
         fetched_after = run.changes
-        made_by_hardcover = {
-            read["id"] for read in (remote or {}).get("user_book_reads", [])
-        } - reads_before
-    read_ids = push_reads(run, title, entries, remote, user_book_id, link)
+    read_ids = push_reads(
+        run,
+        title,
+        entries,
+        remote,
+        user_book_id,
+        link,
+        made_by_hardcover,
+    )
     if run.dry_run:
         return
     # Sessions Hardcover added that no Yamtrack entry took over are removed
-    unused = sorted(made_by_hardcover - set(read_ids.values()))
+    unused = sorted(set(made_by_hardcover) - set(read_ids.values()))
     for read_id in unused:
-        client.delete_read(run.token, read_id)
+        client.delete_read(run.token, read_id, user_book_id)
 
     # Remember Hardcover's updated_at as of our own change, so the next sync
     # doesn't take our push for a change made on Hardcover
@@ -311,18 +329,42 @@ def push_removal(run, media_id, remote, link):
         link.delete()
 
 
-def push_library_entry(run, media_id, title, latest_entry, remote):
+def fetch_made_reads(run, media_id, reads_before, *, wait):
+    """Return the library entry and the sessions Hardcover added on its own.
+
+    Hardcover shows its changes only after a moment, so with wait the entry is
+    fetched again a few times until a new session appears.
+    """
+    attempts = READ_POLL_ATTEMPTS if wait else 1
+    remote = None
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(READ_POLL_DELAY)
+        remote = fetch_remote(run, media_id)
+        made = [
+            read["id"]
+            for read in (remote or {}).get("user_book_reads", [])
+            if read["id"] not in reads_before
+        ]
+        if made:
+            return remote, made
+    return remote, []
+
+
+def push_library_entry(run, media_id, title, entries, remote):
     """Create or update the library entry.
 
     Returns its id (None in a dry run) and whether a status was sent.
     """
+    latest_entry = entries[-1]
     desired = mapping.library_fields(latest_entry)
     if remote is None:
         user_book_id = None
         if not run.dry_run:
+            dates = mapping.status_dates(latest_entry, added_on=entries[0].created_at)
             user_book_id = client.insert_user_book(
                 run.token,
-                {"book_id": int(hardcover_id(run, media_id)), **desired},
+                {"book_id": int(hardcover_id(run, media_id)), **desired, **dates},
             )
         details = mapping_text(desired, skip_empty=True)
         if hardcover_id(run, media_id) != str(media_id):
@@ -333,7 +375,10 @@ def push_library_entry(run, media_id, title, latest_entry, remote):
     changes = mapping.changed_fields(desired, mapping.remote_library_fields(remote))
     if changes:
         if not run.dry_run:
-            client.update_user_book(run.token, remote["id"], changes)
+            fields = dict(changes)
+            if "status_id" in changes:
+                fields.update(mapping.status_dates(latest_entry))
+            client.update_user_book(run.token, remote["id"], fields)
         run.log(Direction.TO_HARDCOVER, "updated", title, mapping_text(changes))
     return remote["id"], "status_id" in changes
 
@@ -348,8 +393,20 @@ def mapping_text(fields, *, skip_empty=False):
     return describe(shown, skip_empty=skip_empty)
 
 
-def push_reads(run, title, entries, remote, user_book_id, link):
-    """Sync one reading session per Yamtrack entry; return the new read map."""
+def push_reads(  # noqa: PLR0917
+    run,
+    title,
+    entries,
+    remote,
+    user_book_id,
+    link,
+    made_by_hardcover=(),
+):
+    """Sync one reading session per Yamtrack entry; return the new read map.
+
+    A session Hardcover just added on its own belongs to the newest entry, the
+    one whose dates were sent with the status.
+    """
     remote_reads = {
         read["id"]: read for read in (remote or {}).get("user_book_reads", [])
     }
@@ -358,8 +415,23 @@ def push_reads(run, title, entries, remote, user_book_id, link):
         for entry_id, read_id in (link.read_ids if link else {}).items()
         if read_id in remote_reads
     }
-    remove_stale_reads(run, title, entries, read_ids)
-    adopt_free_reads(entries, read_ids, remote_reads)
+    latest_key = str(entries[-1].id)
+    if (
+        made_by_hardcover
+        and latest_key not in read_ids
+        and mapping.read_fields(entries[-1])
+    ):
+        read_ids[latest_key] = made_by_hardcover[0]
+    remove_stale_reads(run, title, entries, read_ids, user_book_id)
+    adopt_free_reads(
+        entries,
+        read_ids,
+        {
+            read_id: read
+            for read_id, read in remote_reads.items()
+            if read_id not in made_by_hardcover
+        },
+    )
 
     for entry in entries:
         key = str(entry.id)
@@ -368,7 +440,7 @@ def push_reads(run, title, entries, remote, user_book_id, link):
             if key in read_ids:
                 read_id = read_ids.pop(key)
                 if not run.dry_run:
-                    client.delete_read(run.token, read_id)
+                    client.delete_read(run.token, read_id, user_book_id)
                 run.log(Direction.TO_HARDCOVER, "removed read", title, "no dates")
             continue
         if key not in read_ids:
@@ -389,13 +461,13 @@ def push_reads(run, title, entries, remote, user_book_id, link):
     return read_ids
 
 
-def remove_stale_reads(run, title, entries, read_ids):
+def remove_stale_reads(run, title, entries, read_ids, user_book_id):
     """Remove the reading sessions of deleted Yamtrack entries."""
     entry_ids = {str(entry.id) for entry in entries}
     for entry_id in [key for key in read_ids if key not in entry_ids]:
         read_id = read_ids.pop(entry_id)
         if not run.dry_run:
-            client.delete_read(run.token, read_id)
+            client.delete_read(run.token, read_id, user_book_id)
         run.log(Direction.TO_HARDCOVER, "removed read", title)
 
 
@@ -491,11 +563,11 @@ def pull_changes(run, user_book, status, entries):
 
     read = linked_read(run.user, user_book, latest)
     if read:
-        # Dates cleared on Hardcover are cleared here too. Hardcover often has
-        # no page count for finished reads, so a missing one keeps ours.
+        # Dates cleared on Hardcover are cleared here too. A finished session
+        # has Hardcover's own page count of its edition, so ours is kept then.
         desired["start_date"] = mapping.from_date(read.get("started_at"))
         desired["end_date"] = mapping.from_date(read.get("finished_at"))
-        if read.get("progress_pages") is not None:
+        if read.get("progress_pages") is not None and not read.get("finished_at"):
             desired["progress"] = read["progress_pages"]
 
     changes = {

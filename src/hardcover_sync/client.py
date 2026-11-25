@@ -190,11 +190,40 @@ def update_read(token, read_id, read):
     _mutate(token, "update_user_book_read", query, {"id": read_id, "read": read})
 
 
-def delete_read(token, read_id):
-    """Remove a reading session."""
+def delete_read(token, read_id, user_book_id):
+    """Remove a reading session and its reading journal entries.
+
+    Hardcover keeps the journal entries (progress, finished) of a deleted
+    session, so they would still count as reading on their dates.
+    """
+    query = """
+    query ReadJournals($id: Int!) {
+      me {
+        user_books(where: {id: {_eq: $id}}) {
+          reading_journals { id metadata }
+        }
+      }
+    }
+    """
+    user_books = _me(graphql_request(query, {"id": user_book_id}, token))["user_books"]
+    journals = user_books[0]["reading_journals"] if user_books else []
+    for journal in journals:
+        if (journal.get("metadata") or {}).get("user_book_read_id") == read_id:
+            delete_journal(token, journal["id"])
+
     query = """
     mutation DeleteRead($id: Int!) {
       delete_user_book_read(id: $id) { id error }
     }
     """
     _mutate(token, "delete_user_book_read", query, {"id": read_id})
+
+
+def delete_journal(token, journal_id):
+    """Remove a reading journal entry."""
+    query = """
+    mutation DeleteJournal($id: Int!) {
+      delete_reading_journal(id: $id) { __typename }
+    }
+    """
+    graphql_request(query, {"id": journal_id}, token)

@@ -65,16 +65,42 @@ def library_fields(latest_entry):
     }
 
 
+def is_finished(entry):
+    """Return whether a Yamtrack entry is a finished read."""
+    return entry.end_date is not None or entry.status == Status.COMPLETED.value
+
+
 def read_fields(entry):
-    """Return the reading session of a Yamtrack entry, or None without data."""
+    """Return the reading session of a Yamtrack entry, or None without data.
+
+    Hardcover dates the pages sent with a session to the moment it gets them,
+    so a finished book would show as read today. For a finished session it
+    fills in the page count itself, dated to the finish date, so pages are only
+    sent while a book is still being read.
+    """
     read = {
         "started_at": to_date(entry.start_date),
         "finished_at": to_date(entry.end_date),
-        "progress_pages": entry.progress or None,
     }
+    if not is_finished(entry):
+        read["progress_pages"] = entry.progress or None
     if not any(read.values()):
         return None
     return read
+
+
+def status_dates(entry, *, added_on=None):
+    """Return the dates Hardcover takes along with a status.
+
+    Setting a status makes Hardcover add a reading session of its own; with
+    these dates it gets the Yamtrack dates instead of today.
+    """
+    dates = {
+        "user_start_date": to_date(entry.start_date),
+        "user_date": to_date(entry.end_date),
+        "date_added": to_date(added_on),
+    }
+    return {key: value for key, value in dates.items() if value}
 
 
 def remote_library_fields(user_book):
