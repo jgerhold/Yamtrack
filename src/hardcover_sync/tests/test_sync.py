@@ -55,6 +55,10 @@ class SyncTestCase(TestCase):
         )
         self.account.set_token("own-token")
         self.account.save()
+        # Never really wait for Hardcover in tests
+        no_sleep = patch("hardcover_sync.sync.time.sleep")
+        no_sleep.start()
+        self.addCleanup(no_sleep.stop)
         # No book is merged on Hardcover unless a test says so
         merged = patch(f"{CLIENT}.fetch_merged_books", return_value={})
         self.fetch_merged = merged.start()
@@ -127,16 +131,22 @@ class PushTests(SyncTestCase):
 
         insert_book.assert_called_once_with(
             "Bearer own-token",
-            {"book_id": 11, "status_id": 3, "rating": 4.0, "private_notes": "loved it"},
+            {
+                "book_id": 11,
+                "status_id": 3,
+                "rating": 4.0,
+                "private_notes": "loved it",
+                "user_start_date": "2026-01-05",
+                "user_date": "2026-01-09",
+                "date_added": mapping.to_date(entry.created_at),
+            },
         )
+        # Hardcover added no session of its own here, so one is added; a
+        # finished session goes without pages (Hardcover dates them itself)
         insert_read.assert_called_once_with(
             "Bearer own-token",
             77,
-            {
-                "started_at": "2026-01-05",
-                "finished_at": "2026-01-09",
-                "progress_pages": 300,
-            },
+            {"started_at": "2026-01-05", "finished_at": "2026-01-09"},
         )
         link = HardcoverBookLink.objects.get(user=self.user, media_id="11")
         self.assertEqual(link.user_book_id, 77)
@@ -586,7 +596,7 @@ class ReviewRegressionTests(SyncTestCase):
 
         sync.push_book(self.run_sync(), "47")
 
-        delete_read.assert_called_once_with("Bearer own-token", 61)
+        delete_read.assert_called_once_with("Bearer own-token", 61, 947)
         self.assertEqual(HardcoverBookLink.objects.get(media_id="47").read_ids, {})
 
     @patch(f"{CLIENT}.fetch_library")
@@ -848,3 +858,180 @@ class StopTests(SyncTestCase):
         self.assertEqual(insert.call_count, 1)
         self.account.refresh_from_db()
         self.assertIsNone(self.account.last_synced_at)
+
+
+class DatedSessionTests(SyncTestCase):
+    """Hardcover's own session gets the Yamtrack dates and nothing reads as today."""
+
+    @staticmethod
+    def session(read_id, started, finished, pages=300):
+        """Return a Hardcover reading session."""
+        return {
+            "id": read_id,
+            "started_at": started,
+            "finished_at": finished,
+            "progress_pages": pages,
+        }
+
+    @patch(f"{CLIENT}.update_read")
+    @patch(f"{CLIENT}.insert_read")
+    @patch(f"{CLIENT}.insert_user_book", return_value=77)
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_session_hardcover_shows_late_is_taken_over(
+        self,
+        fetch,
+        _insert_book,
+        insert_read,
+        update_read,
+    ):
+        """Hardcover shows its session only on the second look: no second one."""
+        entry = self.add_entry(
+            "1301",
+            start_date=local_datetime(2020, 5, 1),
+            end_date=local_datetime(2020, 5, 10),
+        )
+        made = remote_book(
+            1301,
+            id=77,
+            user_book_reads=[self.session(700, "2020-05-01", "2020-05-10")],
+        )
+        fetch.side_effect = [None, None, made, made]
+
+        sync.push_book(self.run_sync(), "1301")
+
+        insert_read.assert_not_called()
+        update_read.assert_not_called()
+        link = HardcoverBookLink.objects.get(media_id="1301")
+        self.assertEqual(link.read_ids, {str(entry.id): 700})
+
+    @patch(f"{CLIENT}.update_read")
+    @patch(f"{CLIENT}.insert_read", return_value=701)
+    @patch(f"{CLIENT}.insert_user_book", return_value=77)
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_hardcovers_session_belongs_to_the_newest_read(
+        self,
+        fetch,
+        _insert_book,
+        insert_read,
+        update_read,
+    ):
+        """With a re-read, Hardcover's session (newest dates) isn't redated."""
+        first = self.add_entry(
+            "1302",
+            start_date=local_datetime(2019, 1, 1),
+            end_date=local_datetime(2019, 1, 9),
+        )
+        second = self.add_entry(
+            "1302",
+            start_date=local_datetime(2024, 3, 1),
+            end_date=local_datetime(2024, 3, 9),
+        )
+        made = remote_book(
+            1302,
+            id=77,
+            user_book_reads=[self.session(700, "2024-03-01", "2024-03-09")],
+        )
+        fetch.side_effect = [None, made, made]
+
+        sync.push_book(self.run_sync(), "1302")
+
+        update_read.assert_not_called()
+        insert_read.assert_called_once_with(
+            "Bearer own-token",
+            77,
+            {"started_at": "2019-01-01", "finished_at": "2019-01-09"},
+        )
+        link = HardcoverBookLink.objects.get(media_id="1302")
+        self.assertEqual(link.read_ids, {str(second.id): 700, str(first.id): 701})
+
+    @patch(f"{CLIENT}.update_read")
+    @patch(f"{CLIENT}.fetch_user_book")
+    def test_finished_session_pages_are_not_compared(self, fetch, update_read):
+        """Hardcover's page count of a finished session is no change to push."""
+        entry = self.add_entry(
+            "1303",
+            start_date=local_datetime(2024, 10, 1),
+            end_date=local_datetime(2024, 10, 31),
+            progress=336,
+        )
+        HardcoverBookLink.objects.create(
+            user=self.user,
+            media_id="1303",
+            user_book_id=77,
+            read_ids={str(entry.id): 700},
+        )
+        fetch.return_value = remote_book(
+            1303,
+            id=77,
+            rating=4.0,
+            user_book_reads=[self.session(700, "2024-10-01", "2024-10-31", 318)],
+        )
+
+        sync.push_book(self.run_sync(), "1303")
+
+        update_read.assert_not_called()
+
+    @patch(f"{CLIENT}.fetch_library")
+    def test_pull_keeps_our_pages_of_a_finished_read(self, fetch_library):
+        """A newer Hardcover change doesn't overwrite our pages of a finished read."""
+        self.add_entry(
+            "1304",
+            changed_at=local_datetime(2025, 1, 1),
+            end_date=local_datetime(2024, 10, 31),
+            progress=336,
+        )
+        fetch_library.return_value = [
+            remote_book(
+                1304,
+                status_id=3,
+                rating=4.5,
+                updated_at="2026-02-01T00:00:00+00:00",
+                user_book_reads=[self.session(700, None, "2024-10-31", 318)],
+            ),
+        ]
+
+        sync.sync_user(self.user)
+
+        entry = Book.objects.get(user=self.user, item__media_id="1304")
+        self.assertEqual(entry.progress, 336)
+        self.assertEqual(entry.score, Decimal("9.0"))
+
+
+class DeleteReadTests(TestCase):
+    """Deleting a session also deletes its reading journal entries."""
+
+    @patch("hardcover_sync.client.graphql_request")
+    def test_journals_of_the_session_are_deleted(self, graphql_request):
+        """Only the journal entries of that session go, before the session."""
+        from hardcover_sync import client  # noqa: PLC0415
+
+        journals = {
+            "data": {
+                "me": [
+                    {
+                        "user_books": [
+                            {
+                                "reading_journals": [
+                                    {"id": 1, "metadata": {"user_book_read_id": 61}},
+                                    {"id": 2, "metadata": {"user_book_read_id": 62}},
+                                    {"id": 3, "metadata": None},
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            },
+        }
+        graphql_request.side_effect = [
+            journals,
+            {"data": {"delete_reading_journal": {}}},
+            {"data": {"delete_user_book_read": {"id": 61, "error": None}}},
+        ]
+
+        client.delete_read("token", 61, 947)
+
+        calls = graphql_request.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertIn("delete_reading_journal", calls[1].args[0])
+        self.assertEqual(calls[1].args[1], {"id": 1})
+        self.assertIn("delete_user_book_read", calls[2].args[0])
