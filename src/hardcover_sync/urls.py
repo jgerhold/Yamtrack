@@ -13,4 +13,14 @@ urlpatterns = [
         views.remove_token,
         name="hardcover_remove_token",
     ),
+    path(
+        "settings/hardcover/sync-mode",
+        views.save_sync_mode,
+        name="hardcover_sync_mode",
+    ),
+    path(
+        "settings/hardcover/sync-now",
+        views.sync_now,
+        name="hardcover_sync_now",
+    ),
 ]

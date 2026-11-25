@@ -1,0 +1,79 @@
+{% load i18n %}
+{# Two-way sync settings and log, inside the Hardcover settings card (fork) #}
+<div class="mt-5 pt-5 border-t border-white/10">
+  <h3 class="text-lg font-semibold mb-2">{% trans "Sync with Hardcover" %}</h3>
+  <p class="text-gray-400 mb-4 text-sm">
+    {% blocktrans trimmed %}
+      Keeps your books in Yamtrack and your Hardcover library the same: status, rating, notes and reading dates. Changes in Yamtrack are sent right away, changes on Hardcover are fetched every 6 hours, and the newer change wins. Books removed on Hardcover stay in Yamtrack. Start with a dry run: it only logs what would change.
+    {% endblocktrans %}
+  </p>
+  <div class="flex flex-wrap items-center gap-3">
+    <form method="post"
+          action="{% url 'hardcover_sync_mode' %}"
+          class="flex items-center gap-3">
+      {% csrf_token %}
+      <select name="sync_mode"
+              aria-label="{% trans 'Sync mode' %}"
+              class="py-2 px-3 bg-[#39404b] rounded-md text-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+        <option value="off" {% if account.sync_mode == "off" %}selected{% endif %}>{% trans "Off" %}</option>
+        <option value="dry_run"
+                {% if account.sync_mode == "dry_run" %}selected{% endif %}>
+          {% trans "Dry run: only log what would change" %}
+        </option>
+        <option value="on" {% if account.sync_mode == "on" %}selected{% endif %}>{% trans "On" %}</option>
+      </select>
+      <button type="submit"
+              class="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 transition-colors text-sm cursor-pointer">
+        {% trans "Save" %}
+      </button>
+    </form>
+    {% if account.sync_mode != "off" %}
+      <form method="post" action="{% url 'hardcover_sync_now' %}">
+        {% csrf_token %}
+        <button type="submit"
+                class="px-4 py-2 bg-[#39404b] text-gray-200 rounded-md hover:bg-[#454d5a] transition-colors text-sm cursor-pointer">
+          {% trans "Sync now" %}
+        </button>
+      </form>
+    {% endif %}
+    {% if account.last_synced_at %}
+      <p class="text-xs text-gray-400">
+        {% blocktrans trimmed with synced=account.last_synced_at|timesince %}
+          Last full sync {{ synced }} ago
+        {% endblocktrans %}
+      </p>
+    {% endif %}
+  </div>
+
+  {% with logs=account.recent_sync_logs %}
+    {% if logs %}
+      <div class="mt-4 overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-left text-xs text-gray-400 uppercase">
+            <tr>
+              <th class="py-2 pr-3">{% trans "When" %}</th>
+              <th class="py-2 pr-3">{% trans "Direction" %}</th>
+              <th class="py-2 pr-3">{% trans "Change" %}</th>
+              <th class="py-2 pr-3">{% trans "Book" %}</th>
+              <th class="py-2">{% trans "Details" %}</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            {% for log in logs %}
+              <tr class="{% if log.failed %}text-red-400{% else %}text-gray-200{% endif %}">
+                <td class="py-2 pr-3 whitespace-nowrap text-gray-400">{{ log.created_at|timesince }}</td>
+                <td class="py-2 pr-3 whitespace-nowrap">{{ log.get_direction_display }}</td>
+                <td class="py-2 pr-3 whitespace-nowrap">
+                  {{ log.action }}
+                  {% if log.dry_run %}<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 text-xs">{% trans "dry run" %}</span>{% endif %}
+                </td>
+                <td class="py-2 pr-3">{{ log.title }}</td>
+                <td class="py-2 text-gray-400 break-all">{{ log.details }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% endif %}
+  {% endwith %}
+</div>
