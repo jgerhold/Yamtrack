@@ -7,6 +7,7 @@ never runs on the shared token.
 from app.providers.hardcover import graphql_request
 
 PAGE_SIZE = 100
+MERGED_PAGE_SIZE = 500
 
 USER_BOOK_FIELDS = """
   id
@@ -63,21 +64,56 @@ def fetch_library(token):
         offset += PAGE_SIZE
 
 
-def fetch_user_book(token, book_id):
-    """Return the user's library entry for a Hardcover book, or None."""
+def fetch_user_book(token, book_ids):
+    """Return the user's library entry for one of the Hardcover books, or None.
+
+    book_ids are editions of the same book in order of preference.
+    """
+    book_ids = [int(book_id) for book_id in book_ids]
     query = f"""
-    query LibraryEntry($book_id: Int!) {{
+    query LibraryEntry($book_ids: [Int!]) {{
       me {{
-        user_books(where: {{book_id: {{_eq: $book_id}}}}, limit: 1) {{
+        user_books(where: {{book_id: {{_in: $book_ids}}}}) {{
           {USER_BOOK_FIELDS}
         }}
       }}
     }}
     """
-    entries = _me(graphql_request(query, {"book_id": int(book_id)}, token))[
-        "user_books"
-    ]
-    return entries[0] if entries else None
+    entries = _me(graphql_request(query, {"book_ids": book_ids}, token))["user_books"]
+    return min(
+        entries,
+        key=lambda entry: book_ids.index(entry["book_id"]),
+        default=None,
+    )
+
+
+def fetch_merged_books(token, book_ids):
+    """Return {book id: id it was merged into} for books Hardcover merged.
+
+    Hardcover marks a merged book as a duplicate of another (canonical) book
+    and refuses the duplicate in libraries.
+    """
+    query = """
+    query MergedBooks($ids: [Int!]) {
+      books(where: {
+        id: {_in: $ids}, state: {_eq: "duplicate"}, canonical_id: {_is_null: false}
+      }) {
+        id
+        canonical_id
+      }
+    }
+    """
+    ids = sorted({int(book_id) for book_id in book_ids})
+    merged = {}
+    for start in range(0, len(ids), MERGED_PAGE_SIZE):
+        response = graphql_request(
+            query,
+            {"ids": ids[start : start + MERGED_PAGE_SIZE]},
+            token,
+        )
+        for book in (response.get("data") or {}).get("books") or []:
+            merged[str(book["id"])] = str(book["canonical_id"])
+    return merged
 
 
 def _mutate(token, name, query, variables):

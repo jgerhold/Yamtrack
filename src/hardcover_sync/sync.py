@@ -17,6 +17,7 @@ import logging
 
 from django.apps import apps
 from django.conf import settings
+from django.core.cache import cache
 from django.db.models import Max
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -35,6 +36,11 @@ logger = logging.getLogger(__name__)
 
 Direction = HardcoverSyncLog.Direction
 
+# Hardcover rarely merges books; a full sync refreshes the cached editions
+EDITION_CACHE_TIMEOUT = 60 * 60 * 24
+# A merged book can be merged again; follow that many merges
+MAX_MERGE_HOPS = 3
+
 
 class SyncRun:
     """Changes for one user; in a dry run they are only logged."""
@@ -43,10 +49,31 @@ class SyncRun:
         """Prepare a run with the user's own token."""
         self.user = user
         self.dry_run = dry_run
+        self.stopped = False
         self.token = tokens.require_user_token(user)
         self.started_at = timezone.now()
         self.changes = 0
         self.failures = 0
+        # Yamtrack media_id -> Hardcover book id it syncs with (see editions)
+        self.editions = {}
+
+    def should_stop(self):
+        """Return whether the user changed the sync mode since the run started.
+
+        Checked between books, so switching to Off stops a running sync.
+        """
+        mode = (
+            HardcoverAccount.objects.filter(user=self.user)
+            .values_list("sync_mode", flat=True)
+            .first()
+        )
+        wanted = SyncMode.DRY_RUN if self.dry_run else SyncMode.ON
+        if mode != wanted and not self.stopped:
+            self.stopped = True
+            logger.info(
+                "Hardcover sync stopped for %s: mode is now %s", self.user, mode
+            )
+        return self.stopped
 
     def log(self, direction, action, title, details="", *, failed=False):
         """Record one change (or planned change in a dry run)."""
@@ -88,6 +115,93 @@ def tracked_books(user):
         item__source=Sources.HARDCOVER.value,
         item__media_type=MediaTypes.BOOK.value,
     )
+
+
+def book_title(media_id):
+    """Return the title of a Hardcover book in Yamtrack, for the sync log."""
+    title = (
+        Item.objects.filter(
+            media_id=str(media_id),
+            source=Sources.HARDCOVER.value,
+            media_type=MediaTypes.BOOK.value,
+        )
+        .values_list("title", flat=True)
+        .first()
+    )
+    return title or f"Hardcover book {media_id}"
+
+
+# Merged books ---------------------------------------------------------------
+# Hardcover merges duplicate books into one edition and then refuses the old
+# id in libraries. A Yamtrack book keeps its id; toward Hardcover it syncs
+# with the edition it was merged into.
+
+
+def edition_cache_key(media_id):
+    """Return the cache key of the Hardcover edition a book syncs with."""
+    return f"hardcover_sync_edition_{media_id}"
+
+
+def resolve_editions(run, media_ids, *, refresh=False):
+    """Learn the Hardcover edition of each book, from the cache or Hardcover."""
+    media_ids = {str(media_id) for media_id in media_ids} - set(run.editions)
+    if not refresh:
+        cached = cache.get_many([edition_cache_key(media_id) for media_id in media_ids])
+        for media_id in list(media_ids):
+            if edition_cache_key(media_id) in cached:
+                run.editions[media_id] = cached[edition_cache_key(media_id)]
+                media_ids.discard(media_id)
+    if not media_ids:
+        return
+
+    editions = {media_id: media_id for media_id in media_ids}
+    pending = set(media_ids)
+    for _hop in range(MAX_MERGE_HOPS):
+        if not pending:
+            break
+        merged = client.fetch_merged_books(run.token, pending)
+        pending = set()
+        for media_id, edition in editions.items():
+            if edition in merged:
+                editions[media_id] = merged[edition]
+                pending.add(merged[edition])
+    cache.set_many(
+        {
+            edition_cache_key(media_id): edition
+            for media_id, edition in editions.items()
+        },
+        EDITION_CACHE_TIMEOUT,
+    )
+    run.editions.update(editions)
+
+
+def hardcover_id(run, media_id):
+    """Return the Hardcover book id a Yamtrack book syncs with."""
+    return run.editions.get(str(media_id), str(media_id))
+
+
+def as_yamtrack(run, user_book):
+    """Return a Hardcover library entry with book_id as the Yamtrack media_id."""
+    if not user_book:
+        return user_book
+    merged_into = {
+        edition: media_id
+        for media_id, edition in run.editions.items()
+        if edition != media_id
+    }
+    media_id = merged_into.get(str(user_book["book_id"]))
+    if media_id is None:
+        return user_book
+    return {**user_book, "book_id": int(media_id)}
+
+
+def fetch_remote(run, media_id):
+    """Return the Hardcover library entry of a Yamtrack book, or None."""
+    resolve_editions(run, [media_id])
+    edition = hardcover_id(run, media_id)
+    # An entry made before the merge may still be on the old id
+    book_ids = list(dict.fromkeys([edition, str(media_id)]))
+    return as_yamtrack(run, client.fetch_user_book(run.token, book_ids))
 
 
 LOG_LABELS = {
@@ -135,7 +249,7 @@ def push_book(run, media_id, remote=None, *, remote_known=False):
     entries = book_entries(run.user, media_id)
     link = HardcoverBookLink.objects.filter(user=run.user, media_id=media_id).first()
     if not remote_known:
-        remote = client.fetch_user_book(run.token, media_id)
+        remote = fetch_remote(run, media_id)
 
     if not entries:
         push_removal(run, media_id, remote, link)
@@ -143,15 +257,33 @@ def push_book(run, media_id, remote=None, *, remote_known=False):
 
     title = entries[-1].item.title
     changes_before = run.changes
-    user_book_id = push_library_entry(run, media_id, title, entries[-1], remote)
+    reads_before = {read["id"] for read in (remote or {}).get("user_book_reads", [])}
+    user_book_id, status_sent = push_library_entry(
+        run, media_id, title, entries[-1], remote
+    )
+    made_by_hardcover = set()
+    fetched_after = None
+    if status_sent and not run.dry_run:
+        # Setting a status can make Hardcover add a reading session of its own
+        # (marking a book as read adds one finished today). Fetch it, so
+        # push_reads fills it with the Yamtrack dates instead of adding another.
+        remote = fetch_remote(run, media_id)
+        fetched_after = run.changes
+        made_by_hardcover = {
+            read["id"] for read in (remote or {}).get("user_book_reads", [])
+        } - reads_before
     read_ids = push_reads(run, title, entries, remote, user_book_id, link)
     if run.dry_run:
         return
+    # Sessions Hardcover added that no Yamtrack entry took over are removed
+    unused = sorted(made_by_hardcover - set(read_ids.values()))
+    for read_id in unused:
+        client.delete_read(run.token, read_id)
 
     # Remember Hardcover's updated_at as of our own change, so the next sync
     # doesn't take our push for a change made on Hardcover
-    if run.changes > changes_before:
-        remote = client.fetch_user_book(run.token, media_id)
+    if run.changes > changes_before and (run.changes != fetched_after or unused):
+        remote = fetch_remote(run, media_id)
     HardcoverBookLink.objects.update_or_create(
         user=run.user,
         media_id=media_id,
@@ -180,25 +312,30 @@ def push_removal(run, media_id, remote, link):
 
 
 def push_library_entry(run, media_id, title, latest_entry, remote):
-    """Create or update the library entry; return its id (None in a dry run)."""
+    """Create or update the library entry.
+
+    Returns its id (None in a dry run) and whether a status was sent.
+    """
     desired = mapping.library_fields(latest_entry)
     if remote is None:
         user_book_id = None
         if not run.dry_run:
             user_book_id = client.insert_user_book(
                 run.token,
-                {"book_id": int(media_id), **desired},
+                {"book_id": int(hardcover_id(run, media_id)), **desired},
             )
         details = mapping_text(desired, skip_empty=True)
+        if hardcover_id(run, media_id) != str(media_id):
+            details += f" (merged on Hardcover into book {hardcover_id(run, media_id)})"
         run.log(Direction.TO_HARDCOVER, "added", title, details)
-        return user_book_id
+        return user_book_id, True
 
     changes = mapping.changed_fields(desired, mapping.remote_library_fields(remote))
     if changes:
         if not run.dry_run:
             client.update_user_book(run.token, remote["id"], changes)
         run.log(Direction.TO_HARDCOVER, "updated", title, mapping_text(changes))
-    return remote["id"]
+    return remote["id"], "status_id" in changes
 
 
 def mapping_text(fields, *, skip_empty=False):
@@ -423,16 +560,27 @@ def sync_user(user):
     run = SyncRun(user, dry_run=account.sync_mode == SyncMode.DRY_RUN)
     since = account.last_synced_at
 
-    library = {
-        str(user_book["book_id"]): user_book
-        for user_book in client.fetch_library(run.token)
-    }
+    linked = HardcoverBookLink.objects.filter(user=user).values_list(
+        "media_id",
+        flat=True,
+    )
+    tracked = tracked_books(user).values_list("item__media_id", flat=True)
+    resolve_editions(run, {*linked, *tracked}, refresh=True)
+
+    library = {}
+    for user_book in client.fetch_library(run.token):
+        entry = as_yamtrack(run, user_book)
+        key = str(entry["book_id"])
+        # With entries on both editions, the merged-into edition wins
+        if key not in library or entry is not user_book:
+            library[key] = entry
     pulled = pull_library(run, library, since)
-    unlink_removed(run, library)
-    push_local_changes(run, library, since, pulled)
+    if not run.stopped:
+        unlink_removed(run, library)
+        push_local_changes(run, library, since, pulled)
 
     # After a failure keep the old time, so the failed books are retried
-    if not run.dry_run and not run.failures:
+    if not run.dry_run and not run.failures and not run.stopped:
         account.last_synced_at = run.started_at
         account.save(update_fields=["last_synced_at"])
     HardcoverSyncLog.prune(user)
@@ -446,6 +594,8 @@ def pull_library(run, library, since):
         link.media_id: link for link in HardcoverBookLink.objects.filter(user=run.user)
     }
     for media_id, user_book in library.items():
+        if run.should_stop():
+            return pulled
         status = mapping.HARDCOVER_TO_STATUS.get(user_book.get("status_id"))
         if status is None:
             continue
@@ -504,11 +654,19 @@ def unlink_removed(run, library):
 def push_local_changes(run, library, since, pulled):
     """Push the books changed in Yamtrack since the last sync (all on the first)."""
     for media_id in sorted(local_changes_since(run.user, since) - pulled):
+        if run.should_stop():
+            return
         try:
             push_book(run, media_id, library.get(media_id), remote_known=True)
         except Exception as error:
             logger.exception("Hardcover sync failed for book %s", media_id)
-            run.log(Direction.TO_HARDCOVER, "failed", media_id, str(error), failed=True)
+            run.log(
+                Direction.TO_HARDCOVER,
+                "failed",
+                book_title(media_id),
+                str(error),
+                failed=True,
+            )
 
 
 def local_changes_since(user, since):

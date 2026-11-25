@@ -72,7 +72,7 @@ def push_book(self, user_id, media_id):
             run.log(
                 sync.Direction.TO_HARDCOVER,
                 "failed",
-                media_id,
+                sync.book_title(media_id),
                 str(error),
                 failed=True,
             )
