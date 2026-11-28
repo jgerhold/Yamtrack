@@ -21,6 +21,11 @@ def push_lock_key(user_id, media_id):
     return f"hardcover_sync_push_{user_id}_{media_id}"
 
 
+def owned_lock_key(user_id):
+    """Return the cache key that collects changes of the Owned list."""
+    return f"hardcover_sync_owned_{user_id}"
+
+
 def user_lock_key(user_id):
     """Return the cache key that lets one sync or push run per user."""
     return f"hardcover_sync_user_{user_id}"
@@ -30,6 +35,12 @@ def schedule_push(user_id, media_id):
     """Push a changed book to Hardcover soon, once per burst of changes."""
     if cache.add(push_lock_key(user_id, media_id), 1, timeout=PUSH_DELAY * 3):
         push_book.apply_async(args=[user_id, str(media_id)], countdown=PUSH_DELAY)
+
+
+def schedule_owned_sync(user_id):
+    """Sync the Owned list soon, once per burst of changes."""
+    if cache.add(owned_lock_key(user_id), 1, timeout=PUSH_DELAY * 3):
+        sync_owned.apply_async(args=[user_id], countdown=PUSH_DELAY)
 
 
 def start_run(account, direction):
@@ -77,6 +88,26 @@ def push_book(self, user_id, media_id):
                 failed=True,
             )
             raise
+        return f"{run.changes} change(s)"
+    finally:
+        cache.delete(user_lock_key(user_id))
+
+
+@shared_task(bind=True, name="Hardcover sync owned", max_retries=30)
+def sync_owned(self, user_id):
+    """Make the Hardcover Owned list match the Yamtrack Owned list and back."""
+    cache.delete(owned_lock_key(user_id))
+    account = HardcoverAccount.objects.filter(user_id=user_id).first()
+    if account is None or account.sync_mode == SyncMode.OFF:
+        return "Hardcover sync is off"
+
+    if not cache.add(user_lock_key(user_id), 1, timeout=SYNC_LOCK_TIMEOUT):
+        raise self.retry(countdown=PUSH_RETRY_DELAY)
+    try:
+        run = start_run(account, sync.Direction.TO_HARDCOVER)
+        if run is None:
+            return "Hardcover token missing"
+        sync.sync_owned(run)
         return f"{run.changes} change(s)"
     finally:
         cache.delete(user_lock_key(user_id))

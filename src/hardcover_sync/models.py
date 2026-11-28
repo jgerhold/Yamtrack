@@ -38,6 +38,17 @@ class HardcoverAccount(models.Model):
     )
     # End of the last full sync; changes after it are synced next time
     last_synced_at = models.DateTimeField(null=True, blank=True)
+    # Yamtrack list that mirrors the Owned list on Hardcover
+    owned_list = models.ForeignKey(
+        "lists.CustomList",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    # Hardcover book ids owned on both sides after the last owned sync, to tell
+    # additions from removals; None until the first one
+    owned_media_ids = models.JSONField(null=True, blank=True)
 
     def __str__(self):
         """Return the linked Hardcover username."""

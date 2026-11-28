@@ -10,11 +10,15 @@ Yamtrack changes since the last sync are then pushed. Changes from Hardcover
 are written without signals and history, so they are not pushed back.
 
 A book removed on Hardcover is only unlinked, never deleted in Yamtrack.
+
+Owned books (sync_owned): the Yamtrack list "Owned" and the Owned list on
+Hardcover are kept the same, both ways.
 """
 
 import datetime
 import logging
 import time
+from collections import defaultdict
 
 from django.apps import apps
 from django.conf import settings
@@ -32,6 +36,7 @@ from hardcover_sync.models import (
     HardcoverSyncLog,
     SyncMode,
 )
+from lists.models import CustomList, CustomListItem
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +51,8 @@ SESSION_STATUSES = {2, 3}
 # Hardcover shows a new session after a moment: look this often, this far apart
 READ_POLL_ATTEMPTS = 5
 READ_POLL_DELAY = 2
+# Name of the Yamtrack list that mirrors the Owned list on Hardcover
+OWNED_LIST_NAME = "Owned"
 
 
 class SyncRun:
@@ -186,17 +193,20 @@ def hardcover_id(run, media_id):
     return run.editions.get(str(media_id), str(media_id))
 
 
+def yamtrack_id(run, book_id):
+    """Return the Yamtrack media_id of a Hardcover book id."""
+    for media_id, edition in run.editions.items():
+        if edition != media_id and edition == str(book_id):
+            return media_id
+    return str(book_id)
+
+
 def as_yamtrack(run, user_book):
     """Return a Hardcover library entry with book_id as the Yamtrack media_id."""
     if not user_book:
         return user_book
-    merged_into = {
-        edition: media_id
-        for media_id, edition in run.editions.items()
-        if edition != media_id
-    }
-    media_id = merged_into.get(str(user_book["book_id"]))
-    if media_id is None:
+    media_id = yamtrack_id(run, user_book["book_id"])
+    if media_id == str(user_book["book_id"]):
         return user_book
     return {**user_book, "book_id": int(media_id)}
 
@@ -650,6 +660,8 @@ def sync_user(user):
     if not run.stopped:
         unlink_removed(run, library)
         push_local_changes(run, library, since, pulled)
+    if not run.stopped:
+        sync_owned(run, library)
 
     # After a failure keep the old time, so the failed books are retried
     if not run.dry_run and not run.failures and not run.stopped:
@@ -761,3 +773,201 @@ def local_changes_since(user, since):
     )
     tracked = tracked_books(user).values_list("item__media_id", flat=True)
     return media_ids | (set(linked) - set(tracked))
+
+
+# Owned books ----------------------------------------------------------------
+# Hardcover has an Owned list with one row per owned edition; Yamtrack has a
+# list named "Owned". A book is owned when it is in the list. Neither side
+# dates these changes, so each sync compares both lists with the books owned
+# on both sides after the last one: what was added or removed on one side is
+# added or removed on the other.
+
+
+def sync_owned(run, library=None):
+    """Make the Yamtrack Owned list and the Hardcover Owned list the same.
+
+    library ({media_id: library entry}) saves requests when the caller already
+    fetched it.
+    """
+    list_id, rows = client.fetch_owned(run.token)
+    if list_id is None:
+        return
+    account = HardcoverAccount.objects.get(user=run.user)
+    custom_list = owned_list(run, account)
+    local = owned_items(custom_list)
+    resolve_editions(run, local)
+    remote = defaultdict(list)
+    for row in rows:
+        remote[yamtrack_id(run, row["book_id"])].append(row)
+
+    baseline = account.owned_media_ids
+    if baseline is None:
+        # First owned sync: nothing was removed yet, so only add
+        baseline = set(local) & set(remote)
+    baseline = set(baseline)
+    to_yamtrack = (set(remote) - baseline) - set(local)
+    from_yamtrack = (baseline - set(remote)) & set(local)
+    to_hardcover = (set(local) - baseline) - set(remote)
+    from_hardcover = (baseline - set(local)) & set(remote)
+
+    changes = [
+        *[(media_id, pull_owned, custom_list) for media_id in sorted(to_yamtrack)],
+        *[(media_id, pull_unowned, custom_list) for media_id in sorted(from_yamtrack)],
+        *[(media_id, push_owned, list_id) for media_id in sorted(to_hardcover)],
+        *[(media_id, push_unowned, list_id) for media_id in sorted(from_hardcover)],
+    ]
+    owned = set(local) & set(remote)
+    for media_id, change, target in changes:
+        if run.should_stop():
+            return
+        books = {"item": local.get(media_id), "rows": remote.get(media_id, [])}
+        worked = owned_change(run, change, target, media_id, books, library)
+        adds = change in {pull_owned, push_owned}
+        # A failed removal stays in owned, so it is retried next time
+        if worked == adds:
+            owned.add(media_id)
+
+    if not run.dry_run:
+        account.owned_media_ids = sorted(owned)
+        account.save(update_fields=["owned_media_ids"])
+
+
+def owned_change(run, change, target, media_id, books, library):
+    """Run one owned change; return whether it worked (or would in a dry run)."""
+    try:
+        change(run, target, media_id, books, library)
+    except Exception as error:
+        logger.exception("Hardcover owned sync failed for book %s", media_id)
+        to_hardcover = change in {push_owned, push_unowned}
+        run.log(
+            Direction.TO_HARDCOVER if to_hardcover else Direction.FROM_HARDCOVER,
+            "failed",
+            owned_title(media_id, books),
+            str(error),
+            failed=True,
+        )
+        return False
+    return True
+
+
+def owned_title(media_id, books):
+    """Return the title of an owned book, for the sync log."""
+    if books["item"] is not None:
+        return books["item"].title
+    if books["rows"]:
+        title = (books["rows"][0].get("book") or {}).get("title")
+        if title:
+            return title
+    return book_title(media_id)
+
+
+def owned_list(run, account):
+    """Return the user's Yamtrack Owned list, made when missing (not in a dry run).
+
+    A new list starts a new comparison: books are only added then, so deleting
+    the list in Yamtrack never removes the books from Hardcover's Owned list.
+    """
+    custom_list = account.owned_list
+    if custom_list is not None and custom_list.owner_id == run.user.pk:
+        return custom_list
+    custom_list = (
+        CustomList.objects.filter(owner=run.user, name__iexact=OWNED_LIST_NAME)
+        .order_by("id")
+        .first()
+    )
+    if custom_list is None and run.dry_run:
+        return None
+    if custom_list is None:
+        custom_list = CustomList.objects.create(
+            owner=run.user,
+            name=OWNED_LIST_NAME,
+            description="Books you own, synced with your Owned list on Hardcover.",
+        )
+    account.owned_list = custom_list
+    account.owned_media_ids = None
+    account.save(update_fields=["owned_list", "owned_media_ids"])
+    return custom_list
+
+
+def owned_items(custom_list):
+    """Return {media_id: item} of the Hardcover books in the Owned list."""
+    if custom_list is None:
+        return {}
+    items = custom_list.items.filter(
+        source=Sources.HARDCOVER.value,
+        media_type=MediaTypes.BOOK.value,
+    )
+    return {item.media_id: item for item in items}
+
+
+def pull_owned(run, custom_list, media_id, books, _library):
+    """Add a book owned on Hardcover to the Yamtrack Owned list."""
+    rows = books["rows"]
+    book = rows[0].get("book") or {}
+    title = owned_title(media_id, books)
+    run.log(Direction.FROM_HARDCOVER, "owned", title, "added to the Owned list")
+    if run.dry_run:
+        return
+    item, _created = Item.objects.get_or_create(
+        media_id=media_id,
+        source=Sources.HARDCOVER.value,
+        media_type=MediaTypes.BOOK.value,
+        defaults={
+            "title": title,
+            "image": book.get("cached_image") or settings.IMG_NONE,
+        },
+    )
+    # bulk_create sends no m2m_changed, so the change isn't pushed back
+    list_item = CustomListItem.objects.bulk_create(
+        [CustomListItem(item=item, custom_list=custom_list)],
+    )[0]
+    added = [parse_datetime(row.get("date_added") or "") for row in rows]
+    added = [date for date in added if date]
+    if added and list_item.pk:
+        CustomListItem.objects.filter(pk=list_item.pk).update(date_added=min(added))
+
+
+def pull_unowned(run, custom_list, _media_id, books, _library):
+    """Remove a book no longer owned on Hardcover from the Owned list."""
+    item = books["item"]
+    run.log(
+        Direction.FROM_HARDCOVER,
+        "not owned",
+        item.title,
+        "removed from the Owned list",
+    )
+    if not run.dry_run:
+        # A queryset delete sends no m2m_changed: not pushed back
+        CustomListItem.objects.filter(custom_list=custom_list, item=item).delete()
+
+
+def push_owned(run, list_id, media_id, books, library):
+    """Add a book in the Yamtrack Owned list to the Hardcover Owned list.
+
+    Marks the edition in the user's Hardcover library, else the default ebook.
+    """
+    book_id = hardcover_id(run, media_id)
+    entry = (library or {}).get(media_id)
+    if library is None:
+        entry = fetch_remote(run, media_id)
+    edition_id = (entry or {}).get("edition_id") or (
+        (entry or {}).get("book") or {}
+    ).get("default_ebook_edition_id")
+    if not edition_id:
+        edition_id = client.fetch_ebook_editions(run.token, [book_id]).get(book_id)
+    details = f"edition {edition_id}" if edition_id else "no edition"
+    run.log(Direction.TO_HARDCOVER, "owned", books["item"].title, details)
+    if not run.dry_run:
+        client.add_owned(run.token, list_id, book_id, edition_id)
+
+
+def push_unowned(run, _list_id, media_id, books, _library):
+    """Remove every owned edition of a book from the Hardcover Owned list."""
+    rows = books["rows"]
+    title = owned_title(media_id, books)
+    count = len(rows)
+    details = f"{count} edition{'s' if count != 1 else ''} removed"
+    run.log(Direction.TO_HARDCOVER, "not owned", title, details)
+    if not run.dry_run:
+        for row in rows:
+            client.remove_owned(run.token, row["id"])

@@ -17,6 +17,7 @@ from hardcover_sync.models import (
     HardcoverSyncLog,
     SyncMode,
 )
+from lists.models import CustomList, CustomListItem
 
 CLIENT = "hardcover_sync.sync.client"
 
@@ -63,6 +64,10 @@ class SyncTestCase(TestCase):
         merged = patch(f"{CLIENT}.fetch_merged_books", return_value={})
         self.fetch_merged = merged.start()
         self.addCleanup(merged.stop)
+        # No Owned list on Hardcover unless a test says so
+        owned = patch(f"{CLIENT}.fetch_owned", return_value=(None, []))
+        self.fetch_owned = owned.start()
+        self.addCleanup(owned.stop)
 
     def add_entry(self, media_id, changed_at=None, **fields):
         """Create a Yamtrack book entry without save() side effects."""
@@ -1035,3 +1040,217 @@ class DeleteReadTests(TestCase):
         self.assertIn("delete_reading_journal", calls[1].args[0])
         self.assertEqual(calls[1].args[1], {"id": 1})
         self.assertIn("delete_user_book_read", calls[2].args[0])
+
+
+def owned_row(row_id, book_id, edition_id=None, date_added="2024-05-01T10:00:00+00:00"):
+    """Return a row of the Hardcover Owned list like client.fetch_owned returns."""
+    return {
+        "id": row_id,
+        "book_id": int(book_id),
+        "edition_id": edition_id,
+        "date_added": date_added,
+        "book": {"title": f"Remote {book_id}", "cached_image": "c"},
+    }
+
+
+OWNED_LIST_ID = 77
+
+
+class OwnedTests(SyncTestCase):
+    """Test the sync of the Owned lists."""
+
+    def make_list(self, *media_ids, baseline=None):
+        """Create the Yamtrack Owned list with these books."""
+        custom_list = CustomList.objects.create(owner=self.user, name="Owned")
+        for media_id in media_ids:
+            item, _ = Item.objects.get_or_create(
+                media_id=str(media_id),
+                source=Sources.HARDCOVER.value,
+                media_type=MediaTypes.BOOK.value,
+                defaults={"title": f"Book {media_id}", "image": "i"},
+            )
+            CustomListItem.objects.create(item=item, custom_list=custom_list)
+        self.account.owned_list = custom_list
+        self.account.owned_media_ids = baseline
+        self.account.save()
+        return custom_list
+
+    def remote_owned(self, *rows):
+        """Let Hardcover's Owned list have these rows."""
+        self.fetch_owned.return_value = (OWNED_LIST_ID, list(rows))
+
+    def listed(self):
+        """Return the media_ids in the user's Yamtrack Owned list."""
+        custom_list = CustomList.objects.get(owner=self.user, name="Owned")
+        return sorted(custom_list.items.values_list("media_id", flat=True))
+
+    @patch(f"{CLIENT}.add_owned")
+    def test_first_sync_makes_the_list_from_hardcover(self, add_owned):
+        """Owned books on Hardcover fill a new Owned list, dated as there."""
+        self.add_entry(1)
+        self.remote_owned(
+            owned_row(5, 1, 11, "2026-11-18T20:00:00+00:00"),
+            owned_row(6, 1, 12, "2012-10-31T00:00:00+00:00"),
+            owned_row(7, 2),
+        )
+
+        sync.sync_owned(self.run_sync())
+
+        self.assertEqual(self.listed(), ["1", "2"])
+        self.assertEqual(Item.objects.get(media_id="2").title, "Remote 2")
+        first = CustomListItem.objects.get(item__media_id="1")
+        self.assertEqual(first.date_added.year, 2012)
+        add_owned.assert_not_called()
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.owned_media_ids, ["1", "2"])
+
+    @patch(f"{CLIENT}.fetch_ebook_editions", return_value={"4": 44})
+    @patch(f"{CLIENT}.add_owned")
+    def test_owned_in_yamtrack_marks_library_edition_else_ebook(
+        self,
+        add_owned,
+        _ebooks,
+    ):
+        """The library edition is marked owned, else the default ebook."""
+        self.make_list(3, 4)
+        self.remote_owned()
+        library = {"3": remote_book(3, edition_id=33)}
+
+        sync.sync_owned(self.run_sync(), library)
+
+        add_owned.assert_any_call("Bearer own-token", OWNED_LIST_ID, "3", 33)
+        add_owned.assert_any_call("Bearer own-token", OWNED_LIST_ID, "4", 44)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.owned_media_ids, ["3", "4"])
+
+    @patch(f"{CLIENT}.remove_owned")
+    def test_removed_in_yamtrack_removes_every_edition(self, remove_owned):
+        """A book taken off the Yamtrack list loses all its owned editions."""
+        self.make_list(baseline=["1"])
+        self.remote_owned(owned_row(5, 1, 11), owned_row(6, 1, 12))
+
+        sync.sync_owned(self.run_sync())
+
+        self.assertEqual(
+            [call.args for call in remove_owned.call_args_list],
+            [("Bearer own-token", 5), ("Bearer own-token", 6)],
+        )
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.owned_media_ids, [])
+
+    @patch(f"{CLIENT}.remove_owned")
+    def test_removed_on_hardcover_leaves_the_list(self, remove_owned):
+        """A book no longer owned on Hardcover leaves the Yamtrack list."""
+        self.make_list(1, 2, baseline=["1", "2"])
+        self.remote_owned(owned_row(5, 2))
+
+        sync.sync_owned(self.run_sync())
+
+        self.assertEqual(self.listed(), ["2"])
+        remove_owned.assert_not_called()
+
+    @patch(f"{CLIENT}.remove_owned")
+    def test_deleted_yamtrack_list_removes_nothing_on_hardcover(self, remove_owned):
+        """Deleting the Yamtrack list makes a new one instead of unowning."""
+        self.make_list(1, baseline=["1"]).delete()
+        self.remote_owned(owned_row(5, 1))
+
+        sync.sync_owned(self.run_sync())
+
+        remove_owned.assert_not_called()
+        self.assertEqual(self.listed(), ["1"])
+
+    @patch(f"{CLIENT}.remove_owned", side_effect=Exception("boom"))
+    def test_failed_removal_is_retried(self, _remove_owned):
+        """A removal that failed stays owned, so the next sync tries again."""
+        self.make_list(baseline=["1"])
+        self.remote_owned(owned_row(5, 1))
+
+        run = self.run_sync()
+        sync.sync_owned(run)
+
+        self.assertEqual(run.failures, 1)
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.owned_media_ids, ["1"])
+
+    @patch(f"{CLIENT}.add_owned")
+    def test_merged_book_counts_as_owned(self, add_owned):
+        """A book Hardcover merged is owned under the merged-into id."""
+        self.fetch_merged.side_effect = lambda _token, ids: (
+            {"8": "80"} if "8" in ids else {}
+        )
+        self.make_list(8)
+        self.remote_owned(owned_row(5, 80))
+
+        sync.sync_owned(self.run_sync())
+
+        add_owned.assert_not_called()
+        self.assertEqual(self.listed(), ["8"])
+        self.account.refresh_from_db()
+        self.assertEqual(self.account.owned_media_ids, ["8"])
+
+    @patch(f"{CLIENT}.remove_owned")
+    @patch(f"{CLIENT}.add_owned")
+    def test_dry_run_changes_nothing(self, add_owned, remove_owned):
+        """A dry run logs the changes but writes nothing."""
+        self.account.sync_mode = SyncMode.DRY_RUN
+        self.account.save()
+        self.remote_owned(owned_row(5, 1))
+
+        run = self.run_sync(dry_run=True)
+        sync.sync_owned(run)
+
+        self.assertFalse(CustomList.objects.filter(owner=self.user).exists())
+        add_owned.assert_not_called()
+        remove_owned.assert_not_called()
+        self.assertEqual(run.changes, 1)
+        self.account.refresh_from_db()
+        self.assertIsNone(self.account.owned_media_ids)
+
+    def test_no_owned_list_on_hardcover(self):
+        """Without an Owned list on Hardcover nothing happens."""
+        sync.sync_owned(self.run_sync())
+
+        self.assertFalse(CustomList.objects.filter(owner=self.user).exists())
+
+    @patch(f"{CLIENT}.fetch_library", return_value=[])
+    def test_full_sync_includes_owned(self, _fetch_library):
+        """The full sync also syncs the Owned list."""
+        self.remote_owned(owned_row(5, 1))
+
+        sync.sync_user(self.user)
+
+        self.assertEqual(self.listed(), ["1"])
+
+    @patch("hardcover_sync.tasks.schedule_owned_sync")
+    def test_list_change_schedules_owned_sync(self, schedule):
+        """Adding to or removing from the Owned list schedules an owned sync."""
+        custom_list = self.make_list()
+        item = Item.objects.create(
+            media_id="9",
+            source=Sources.HARDCOVER.value,
+            media_type=MediaTypes.BOOK.value,
+            title="Book 9",
+            image="i",
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            custom_list.items.add(item)
+        with self.captureOnCommitCallbacks(execute=True):
+            custom_list.items.remove(item)
+        with self.captureOnCommitCallbacks(execute=True):
+            CustomList.objects.create(owner=self.user, name="Other").items.add(item)
+
+        self.assertEqual(schedule.call_count, 2)
+        schedule.assert_called_with(self.user.id)
+
+    @patch("hardcover_sync.tasks.schedule_owned_sync")
+    def test_sync_writes_are_not_pushed_back(self, schedule):
+        """Books the sync adds from Hardcover don't schedule an owned sync."""
+        self.make_list()
+        self.remote_owned(owned_row(5, 1))
+
+        with self.captureOnCommitCallbacks(execute=True):
+            sync.sync_owned(self.run_sync())
+
+        schedule.assert_not_called()
+        self.assertEqual(self.listed(), ["1"])

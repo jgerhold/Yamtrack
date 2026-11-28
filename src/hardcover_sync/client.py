@@ -12,11 +12,12 @@ MERGED_PAGE_SIZE = 500
 USER_BOOK_FIELDS = """
   id
   book_id
+  edition_id
   status_id
   rating
   private_notes
   updated_at
-  book { title pages cached_image(path: "url") }
+  book { title pages cached_image(path: "url") default_ebook_edition_id }
   user_book_reads(order_by: [{started_at: asc_nulls_last}, {id: asc}]) {
     id
     started_at
@@ -227,3 +228,90 @@ def delete_journal(token, journal_id):
     }
     """
     graphql_request(query, {"id": journal_id}, token)
+
+
+# Owned books ----------------------------------------------------------------
+# Hardcover keeps owned books in a list of the user with the slug "owned", one
+# row per owned edition. user_books.owned doesn't follow that list.
+
+OWNED_LIST_SLUG = "owned"
+
+
+def fetch_owned(token):
+    """Return the id of the user's Owned list and its rows, or (None, [])."""
+    query = """
+    query OwnedList($slug: String!) {
+      me { lists(where: {slug: {_eq: $slug}}) { id } }
+    }
+    """
+    lists = _me(graphql_request(query, {"slug": OWNED_LIST_SLUG}, token))["lists"]
+    if not lists:
+        return None, []
+    list_id = lists[0]["id"]
+
+    query = """
+    query OwnedBooks($list_id: Int!, $limit: Int!, $offset: Int!) {
+      list_books(
+        where: {list_id: {_eq: $list_id}}
+        limit: $limit
+        offset: $offset
+        order_by: {id: asc}
+      ) {
+        id
+        book_id
+        edition_id
+        date_added
+        book { title cached_image(path: "url") }
+      }
+    }
+    """
+    rows = []
+    offset = 0
+    while True:
+        variables = {"list_id": list_id, "limit": PAGE_SIZE, "offset": offset}
+        page = (graphql_request(query, variables, token).get("data") or {}).get(
+            "list_books",
+        ) or []
+        rows.extend(page)
+        if len(page) < PAGE_SIZE:
+            return list_id, rows
+        offset += PAGE_SIZE
+
+
+def fetch_ebook_editions(token, book_ids):
+    """Return {book id: id of its default ebook edition} where it has one."""
+    query = """
+    query EbookEditions($ids: [Int!]) {
+      books(where: {id: {_in: $ids}}) { id default_ebook_edition_id }
+    }
+    """
+    ids = sorted({int(book_id) for book_id in book_ids})
+    response = graphql_request(query, {"ids": ids}, token)
+    return {
+        str(book["id"]): book["default_ebook_edition_id"]
+        for book in (response.get("data") or {}).get("books") or []
+        if book.get("default_ebook_edition_id")
+    }
+
+
+def add_owned(token, list_id, book_id, edition_id):
+    """Add a book (edition) to the user's Owned list; return the row id."""
+    query = """
+    mutation AddOwned($object: ListBookInput!) {
+      insert_list_book(object: $object) { id }
+    }
+    """
+    fields = {"list_id": list_id, "book_id": int(book_id)}
+    if edition_id:
+        fields["edition_id"] = int(edition_id)
+    return _mutate(token, "insert_list_book", query, {"object": fields})["id"]
+
+
+def remove_owned(token, list_book_id):
+    """Remove one row (an owned edition) from the Owned list."""
+    query = """
+    mutation RemoveOwned($id: Int!) {
+      delete_list_book(id: $id) { id }
+    }
+    """
+    _mutate(token, "delete_list_book", query, {"id": list_book_id})
